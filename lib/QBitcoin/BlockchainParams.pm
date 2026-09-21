@@ -74,7 +74,9 @@ use constant COMMON_CONST => {
     UPGRADE_FEE        => 0.01, # 1%
     UPGRADE_MAX_BLOCKS => 4200000, # March 2026
     UPGRADE_MAX_VALUE  => 333_000_000 * 100_000_000, # 333M ECR - stop conversion when upgraded reaches this
-    STATIC_REWARD      => 10000000,   # 0.1 ECR per block after hardfork 2026-08-01
+    STATIC_REWARD      => 10000000,   # 0.1 ECR per BLOCK_INTERVAL after hardfork 2026-08-01; Block::static_reward()
+                                      # scales it by the number of timeslots since the previous block, so a block that
+                                      # closes a gap of N slots mints N times this, not once
     REWARD_HALVING     => 10_000_000, # blocks, halving every ~ 3 years and emit 4M QBTC total as block rewards
     STAKE_MATURITY     => 12*3600,    # 12 hours
 };
