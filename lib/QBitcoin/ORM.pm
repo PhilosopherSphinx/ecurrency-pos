@@ -20,7 +20,11 @@ use constant DB_TYPES;
 use constant DEBUG_ORM => 0;
 
 use parent 'Exporter';
-our @EXPORT_OK = qw(dbh find fetch create replace update delete delete_by IGNORE DEBUG_ORM for_log);
+our @EXPORT_OK = qw(dbh find fetch create replace update delete delete_by);
+push @EXPORT_OK, qw(IGNORE DEBUG_ORM for_log wal_checkpoint_truncate);
+push @EXPORT_OK, qw(db_alive db_failed mark_db_failed);
+push @EXPORT_OK, qw(db_pool_take db_pool_loaned db_pool_release db_pool_returned db_pool_maintain db_pool_close db_pool_stats);
+push @EXPORT_OK, qw(reset_dbh_after_fork disconnect_dbh);
 push @EXPORT_OK, keys %{&DB_TYPES};
 our %EXPORT_TAGS = ( types => [ keys %{&DB_TYPES} ] );
 
@@ -34,11 +38,59 @@ use constant KEY_RE => qr/^[a-z][a-z0-9_]*\z/;
 
 use constant IGNORE => \undef; # { key => IGNORE } may be used to override default check for "key" column
 
+# Pre-opened connections for forked read-only request handlers (see QBitcoin::Fork).
+# Opening a database connection (tcp connect, authentication handshake) costs more than
+# the whole short request, so the master keeps a few spare connections open and lends one
+# to each forked child; the child inherits it ready to use and never opens its own.
+# The master itself never runs queries on the pooled connections, so a child gets a
+# connection in a clean idle state. A connection is lent to at most one live child; when
+# the child exits the master validates the connection and puts it back into the pool.
+# The pool is not opened in advance in full: it grows by one connection each time a child
+# had to open its own because the pool was empty, and shrinks back when a connection stays
+# unused. So a node which gets no read-only requests keeps no spare connections at all,
+# and a node which serves them keeps as many as its request rate needs, up to the limit.
+# Connections are opened from the main loop and one per pass, never during the request
+# processing: connect() blocks the single-threaded master, and a slow or unavailable
+# database server would stall it on every request instead of once per retry period.
+use constant DB_POOL_PING_INTERVAL => 60;  # sec, keep-alive/validation period, well below mysql wait_timeout
+use constant DB_POOL_RETRY_TIME    => 10;  # sec, do not retry connect to an unavailable database too often
+use constant DB_POOL_IDLE_TIMEOUT  => 300; # sec, release a connection which was not needed for this long
+
 my $dbh;
 my $dsn;
+my @DB_POOL;   # idle pre-opened connections, [ { dbh => $handle, checked => $time, used => $time }, ... ]
+my %DB_LOANED; # pid of a forked child => connection entry currently used by that child
+my $POOL_WANTED = 0; # number of connections the observed request rate needs
+my $POOL_RETRY_AT = 0;
+my $DB_FAILED; # message of an unrecoverable database error, see mark_db_failed()
 
 sub dbh {
-    return $dbh if $dbh;
+    return $dbh //= _connect();
+}
+
+# Record an error after which the connection cannot be trusted anymore: a failed rollback
+# (see QBitcoin::ORM::Transaction) may leave the transaction open on the server with its
+# partial changes, and nothing tells whether the following statements ever commit.
+# The process must not go on working with the database after that; the main process dies
+# on the next check (QBitcoin::HTTP::receive), outside the request handlers no exception is
+# caught at all and the original error terminates it
+sub mark_db_failed {
+    my ($error) = @_;
+    $DB_FAILED //= $error;
+    return;
+}
+
+sub db_failed {
+    return $DB_FAILED;
+}
+
+sub db_alive {
+    return 0 if defined $DB_FAILED;
+    return 1 unless $dbh; # nothing to check, the next use opens a new connection
+    return eval { $dbh->ping } ? 1 : 0;
+}
+
+sub _connect {
     my $dbi = $config->{dbi} // "mysql";
     my $db_name = $config->{database} // DB_NAME;
     my $location = "localhost";
@@ -48,7 +100,7 @@ sub dbh {
         $db_name .= ".sqlite" unless $db_name =~ /\.sqlite$/;
     }
     elsif ($dbi eq "mysql") {
-        $db_name .= ";mysql_read_default_file=$ENV{HOME}/my.cnf";
+        $db_name .= ";mysql_read_default_file=$ENV{HOME}/.my.cnf";
     }
     if (!$dsn) {
         $dsn = $config->{"dsn"} // ("DBI:$dbi:$db_name" . ($location ? ":$location" : ""));
@@ -56,24 +108,196 @@ sub dbh {
     }
     my $login = $config->{"db.login"};
     my $password = $config->{"db.password"};
-    $dbh = DBI->connect($dsn, $login, $password, DB_OPTS);
+    my $handle = DBI->connect($dsn, $login, $password, DB_OPTS);
     if ($dbi eq "SQLite") {
-        $dbh->do("PRAGMA foreign_keys = ON");
+        $handle->do("PRAGMA foreign_keys = ON");
         # WAL allows forked read-only request handlers to read while the main process writes
-        $dbh->do("PRAGMA journal_mode = WAL");
-        $dbh->do("PRAGMA busy_timeout = 5000");
+        $handle->do("PRAGMA journal_mode = WAL");
+        $handle->do("PRAGMA busy_timeout = 5000");
+        $handle->do("PRAGMA secure_delete = ON");
     };
-    return $dbh;
+    return $handle;
 }
 
 # Called in a forked child: the inherited handle shares the connection with the parent,
-# so it must not be used and must not send a disconnect on DESTROY; drop it and let
-# the next dbh() call open a fresh connection
+# so it must not be used and must not send a disconnect on DESTROY; drop it and use the
+# connection lent by the master (if any), otherwise the next dbh() call opens a fresh one
 sub reset_dbh_after_fork {
+    my ($loaned) = @_;
     if ($dbh) {
         $dbh->{InactiveDestroy} = 1;
         undef $dbh;
     }
+    # The whole pool belongs to the master; the child must not send a disconnect for any of
+    # these connections, neither for those still idle in the pool nor for the one lent to it
+    # (the master keeps it and lends it to the next child after this one exits)
+    foreach my $entry (@DB_POOL, values %DB_LOANED, $loaned ? $loaned : ()) {
+        $entry->{dbh}->{InactiveDestroy} = 1;
+    }
+    @DB_POOL = ();
+    %DB_LOANED = ();
+    $dbh = $loaned->{dbh} if $loaned;
+    return;
+}
+
+sub _disconnect {
+    my ($handle) = @_;
+    return if $handle->{InactiveDestroy}; # inherited from the parent, not ours to close
+    $handle->{Warn} = 0; # do not complain about statement handles still active
+    eval { $handle->disconnect(); 1 }
+        or Debugf("Error on database disconnect: %s", $@ =~ s/\s+$//r);
+    return;
+}
+
+# Close the connection opened by this process, if any. Needed before POSIX::_exit()
+# which skips destructors, otherwise the connection is dropped without COM_QUIT and
+# the server logs "Aborted connection ... (Got an error reading communication packets)".
+# A connection lent by the master is marked InactiveDestroy and is left open for reuse.
+sub disconnect_dbh {
+    my $handle = $dbh
+        or return;
+    undef $dbh;
+    _disconnect($handle);
+    return;
+}
+
+# Move all WAL content into the main database file and truncate the WAL file
+sub wal_checkpoint_truncate {
+    my $handle = dbh();
+    return 1 if $handle->get_info(17) ne "SQLite";
+    my ($busy, $log, $checkpointed) = $handle->selectrow_array("PRAGMA wal_checkpoint(TRUNCATE)");
+    if ($busy) {
+        # A concurrent reader (forked request handler) blocked the truncation
+        Warningf("WAL file not truncated (%d of %d pages checkpointed), replaced data remains there until the next checkpoint cycle",
+            $checkpointed, $log);
+        return 0;
+    }
+    return 1;
+}
+
+# Pooling makes sense only for a connection to a database server; an SQLite connection is
+# just an open file, it costs nothing to open and must not be carried across fork() at all
+sub db_pool_enabled {
+    return 0 if lc($config->{dbi} // "mysql") eq "sqlite";
+    return 0 if ($config->{dsn} // "") =~ /^dbi:sqlite\b/i;
+    return 1;
+}
+
+# Called from the main loop: open the connections the forked handlers were short of,
+# keep the idle ones alive and release the ones which are not needed anymore
+sub db_pool_maintain {
+    my ($size) = @_;
+
+    $size = 0 unless db_pool_enabled();
+    $POOL_WANTED = $size if $POOL_WANTED > $size;
+    my $time = time();
+    @DB_POOL = grep { _pool_check($_, $time) } @DB_POOL;
+    my $pool_size = @DB_POOL + keys %DB_LOANED;
+    # Only one connection per call: the whole pool may need to be reopened at once
+    # (the database server was restarted), and connecting is a blocking operation
+    if ($pool_size < $POOL_WANTED && $POOL_RETRY_AT <= $time) {
+        my $handle = eval { _connect() };
+        if (!$handle) {
+            Warningf("Cannot open pooled database connection: %s", $@ =~ s/\s+$//r);
+            $POOL_RETRY_AT = $time + DB_POOL_RETRY_TIME;
+            return;
+        }
+        Debugf("Opened pooled database connection %u of %u", ++$pool_size, $size);
+        push @DB_POOL, { dbh => $handle, checked => $time, used => $time };
+    }
+    while ($pool_size > $POOL_WANTED && @DB_POOL) {
+        # The limit was reduced by the config
+        _disconnect(shift(@DB_POOL)->{dbh});
+        $pool_size--;
+    }
+    # Connections are lent from the end of the pool, so the first one is the least recently
+    # used; if even it was not needed for a long time then the pool is larger than necessary
+    if (@DB_POOL && $POOL_WANTED > 0 && $DB_POOL[0]->{used} + DB_POOL_IDLE_TIMEOUT < $time) {
+        Debugf("Release pooled database connection unused for %u sec", $time - $DB_POOL[0]->{used});
+        _disconnect(shift(@DB_POOL)->{dbh});
+        $POOL_WANTED--;
+    }
+    return;
+}
+
+sub _pool_check {
+    my ($entry, $time) = @_;
+
+    return 1 if $entry->{checked} + DB_POOL_PING_INTERVAL > $time;
+    if (eval { $entry->{dbh}->ping }) {
+        $entry->{checked} = $time;
+        return 1;
+    }
+    Debugf("Pooled database connection is dead, drop it");
+    _disconnect($entry->{dbh});
+    return 0;
+}
+
+# Number of connections idle in the pool, lent to forked children and needed in total
+sub db_pool_stats {
+    return (scalar @DB_POOL, scalar keys %DB_LOANED, $POOL_WANTED);
+}
+
+# Called in the master right before fork(): reserve a connection for the child.
+# Returns undef if the pool is empty, then the child opens its own connection as usual
+# and the master pre-opens one more connection for the next request.
+sub db_pool_take {
+    my $entry = pop @DB_POOL # the most recently used one, let the spare ones age out
+        or return _pool_missed();
+    $entry->{used} = time();
+    return $entry;
+}
+
+# The pool was empty, so all its connections are lent out and one more is needed than
+# we have; count it as the new pool size (limited by the configured one in db_pool_maintain)
+sub _pool_missed {
+    my $needed = keys(%DB_LOANED) + 1;
+    $POOL_WANTED = $needed if db_pool_enabled() && $POOL_WANTED < $needed;
+    return undef;
+}
+
+# fork() succeeded, the connection is now in use by the child until it exits
+sub db_pool_loaned {
+    my ($entry, $pid) = @_;
+    $DB_LOANED{$pid} = $entry;
+    return;
+}
+
+# fork() failed, the reserved connection was not used by anyone
+sub db_pool_release {
+    my ($entry) = @_;
+    push @DB_POOL, $entry;
+    return;
+}
+
+# The forked child has exited, take its connection back. The child does not send COM_QUIT,
+# so the connection is still alive (the master holds its own descriptor of the same socket)
+# and, if the child finished its request normally, is idle and ready for the next one.
+sub db_pool_returned {
+    my ($pid, $status) = @_;
+
+    my $entry = delete $DB_LOANED{$pid}
+        or return;
+    if ($status) {
+        # Killed or died in the middle of a query: the connection may have an unread reply
+        Debugf("Forked request handler exited with status %u, drop its database connection", $status);
+        _disconnect($entry->{dbh});
+        return;
+    }
+    $entry->{checked} = 0; # validate before lending it to the next child
+    push @DB_POOL, $entry if _pool_check($entry, time());
+    return;
+}
+
+# Called on shutdown, before global destruction disconnects the pooled handles:
+# a COM_QUIT for a connection which is currently used by a forked child would break
+# the request the child is processing, so such connections are only dropped
+sub db_pool_close {
+    _disconnect($_->{dbh}) foreach @DB_POOL;
+    $_->{dbh}->{InactiveDestroy} = 1 foreach values %DB_LOANED;
+    @DB_POOL = ();
+    %DB_LOANED = ();
+    return;
 }
 
 sub for_log {

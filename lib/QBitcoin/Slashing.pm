@@ -9,8 +9,8 @@ use strict;
 # is not signed: any node that observes the two conflicting stakes can build it, and
 # every node builds the byte-identical transaction from the same evidence.
 #
-# Evidence layout (placed right after tx_type in the transaction, like a downgrade
-# payload), two proofs ordered by the stake-tx hash ascending:
+# Evidence layout (placed right after tx_type in the transaction,
+# two proofs ordered by the stake-tx hash ascending:
 #
 #   proof  := prev_hash(32) . pack("N", timeslot) . digest(32) . varstr(stake_tx_bytes)
 #   payload:= proof[0] . proof[1]
@@ -26,6 +26,16 @@ use strict;
 # becomes the transaction fee (into the reward fund). Refund outputs are plain outputs
 # at the owner's scripthash and so are subject to the same STAKE_MATURITY spend lock as
 # stake outputs (enforced for the spender in check_input_script).
+#
+# A refund can be spent ONLY by a standard (or tokens) transaction: staking it again is
+# consensus-invalid (Transaction::validate), and so is slashing it again
+# (Transaction::validate_slashing). Equivocation means the staking setup is broken or a
+# delegate is dishonest, so the punished coins are fail-stopped until the owner
+# deliberately moves them. For delegated coins this is a hard stop for the delegate:
+# the covenant's delegate branch only allows spending into a stake, so after one fine
+# the delegate can neither keep staking the refund nor fabricate further conflicting
+# stake signatures on it to grind the owner's coins down fine by fine - only the
+# owner's key can free the coins.
 
 use QBitcoin::Accessors qw(new mk_accessors);
 use QBitcoin::Log;
@@ -303,6 +313,9 @@ sub observe {
         foreach my $s (keys %SEEN) {
             delete $SEEN{$s} if $s < $cutoff;
         }
+        foreach my $key (keys %BANNED) {
+            delete $BANNED{$key} if $BANNED{$key}->{timeslot} < $cutoff;
+        }
     }
     my $slot = $SEEN{$timeslot} //= {};
     my $conflict;
@@ -319,6 +332,29 @@ sub observe {
         }
     }
     return $conflict;
+}
+
+# Forget a stake of our own whose block never became best: it was not announced and
+# its stake tx was dropped with the block, so the signature never left this node and
+# can never become part of equivocation evidence. Keeping it watched would only stop
+# us from staking the same UTXO again in this slot - or worse, make us slash ourselves
+# when we do. Matched by block_sign_data (the equivocation identity): an entry with a
+# different block_sign_data is a DIFFERENT signed message - potential evidence that
+# must stay watched.
+sub forget_stake {
+    my $class = shift;
+    my ($stake, $timeslot) = @_;
+    $stake && $stake->is_stake
+        or return;
+    my $slot = $SEEN{$timeslot}
+        or return;
+    foreach my $in (@{$stake->in}) {
+        my $key  = $in->{txo}->key;
+        my $snap = $slot->{$key}
+            or next;
+        delete $slot->{$key} if $snap->block_sign_data eq $stake->block_sign_data;
+    }
+    delete $SEEN{$timeslot} if !%$slot;
 }
 
 # A retained copy of a stake for the %SEEN watch list. It is a genuine
@@ -379,10 +415,6 @@ sub ban_from_tx {
     if ($timeslot > $MAX_SLOT) {
         $MAX_SLOT = $timeslot;
     }
-    my $cutoff = $MAX_SLOT - SLASHING_WINDOW * BLOCK_INTERVAL;
-    foreach my $key (keys %BANNED) {
-        delete $BANNED{$key} if $BANNED{$key}->{timeslot} < $cutoff;
-    }
 }
 
 # Is this stake one we hold equivocation evidence for at the given timeslot? Used by
@@ -406,15 +438,24 @@ sub is_banned_stake {
 sub banned_height_in_best {
     my $class = shift;
     my $min;
+    my $max_db_height = QBitcoin::Block->max_db_height;
     foreach my $key (keys %BANNED) {
-        my $txo = $BANNED{$key}->{txo}
+        my $b = $BANNED{$key};
+        my $txo = $b->{txo}
             or next;
         my $out = $txo->tx_out
             or next; # not spent in the best branch (already dropped / never confirmed)
         my $sp = QBitcoin::Transaction->get($out)
             or next;
+        # Punishable is only the equivocated stake itself: the confirmed slashing tx
+        # spends the same UTXO (that is the penalty, not equivocation), and the UTXO
+        # may be legitimately staked in a different timeslot. A stake is confirmed in
+        # the block it signed, so the block time identifies the stake's timeslot.
+        next unless $sp->is_stake;
         my $h = $sp->block_height;
         next unless defined $h; # spender not confirmed in the best branch
+        next if $h <= $max_db_height;
+        next unless defined($sp->block_time) && timeslot($sp->block_time) == $b->{timeslot};
         $min = $h if !defined($min) || $h < $min;
     }
     return $min;

@@ -36,10 +36,17 @@ use constant QBT_SEQUENCE_LOCKTIME_TYPE_FLAG => 1 << 27;
 
 use constant MAX_SCRIPT_EXEC_DEPTH => 16;
 
-# Allow attributes "in1", "in2", etc
+# Allow attributes "in1", "in2", etc; store them so attributes::get() can fetch them back
+my %CODE_ATTRS;
 sub MODIFY_CODE_ATTRIBUTES {
     my ($class, $code, @attrs) = @_;
+    push @{$CODE_ATTRS{$code}}, grep { /^in[0-9]+$/ } @attrs;
     return grep { !/^in[0-9]+$/ } @attrs;
+}
+
+sub FETCH_CODE_ATTRIBUTES {
+    my ($class, $code) = @_;
+    return @{$CODE_ATTRS{$code} // []};
 }
 
 my %INT_2_1 = (
@@ -68,18 +75,18 @@ my %PUSH_CONST = (
 my %COMMON_CMD = (
     drop    => sub :in1 { pop },
     dup     => sub :in1 { push @_, $_[-1] },
-    equal   => sub :in2 { push @_, pop eq pop },
+    equal   => sub :in2 { push @_, pop eq pop ? TRUE : FALSE },
     '2drop' => sub :in2 { splice(@_,-2) },
     '2dup'  => sub :in2 { push @_, @_[-2,-1] },
     '3dup'  => sub :in3 { push @_, @_[-3,-2,-1] },
     '2over' => sub :in4 { push @_, @_[-4,-3] },
     '2rot'  => sub :in6 { push @_, splice(@_,-6,2) },
     '2swap' => sub :in4 { push @_, splice(@_,-4,2) },
-    ifdup   => sub :in4 { push @_, $_[-1] if is_true($_[-1]) },
-    depth   => sub :in4 { push @_, pack_int(scalar @_) },
+    ifdup   => sub :in1 { push @_, $_[-1] if is_true($_[-1]) },
+    depth   => sub { push @_, pack_int(scalar @_) },
     nip     => sub :in2 { splice(@_,-2,1) },
     over    => sub :in2 { push @_, $_[-2] },
-    rot     => sub :in2 { push @_, splice(@_,-3,1) },
+    rot     => sub :in3 { push @_, splice(@_,-3,1) },
     swap    => sub :in2 { push @_, splice(@_,-2,1) },
     tuck    => sub :in2 { splice(@_,-2,0,$_[-1]) },
     size    => sub :in1 { push @_, pack_int(length($_[-1])) },
@@ -129,7 +136,7 @@ foreach my $opcode (keys %{&OPCODES}) {
             my $stack = $state->stack;
             @$stack >= 1 or return 0;
             local $a = unpack_int(pop @$stack) // return 0;
-            push @$stack, pack_int($INT_1_1{$cmd}->());
+            push @$stack, pack_int($INT_1_1{$cmd}->()) // return 0;
             return undef;
         };
     }
@@ -140,7 +147,7 @@ foreach my $opcode (keys %{&OPCODES}) {
             my $stack = $state->stack;
             @$stack >= 2 or return 0;
             local ($a, $b) = map { unpack_int($_) // return 0 } splice(@$stack, -2);
-            push @$stack, pack_int($INT_2_1{$cmd}->());
+            push @$stack, pack_int($INT_2_1{$cmd}->()) // return 0;
             return undef;
         };
     }
@@ -166,7 +173,7 @@ foreach my $opcode (keys %{&OPCODES}) {
 foreach my $opcode (0x01 .. 0x4b) {
     $OP_CMD[$opcode] = sub { pushdatan($opcode, @_) };
 }
-foreach my $opcode (0xbb .. 0xfe) {
+foreach my $opcode (0xbe .. 0xfe) {
     $OP_CMD[$opcode] = sub { success(@_) };
 }
 foreach (1 .. 10) {
@@ -439,6 +446,65 @@ sub cmd_checksequenceverify($) {
     return undef;
 }
 
+# OP_TX_TYPE: push the type of the transaction being validated.
+# Pushed as a script integer.
+sub cmd_tx_type($) {
+    my ($state) = @_;
+    return unless $state->ifstate;
+    push @{$state->stack}, pack_int($state->tx->tx_type);
+    return undef;
+}
+
+# OP_INPUTSCRIPTHASH: push the scripthash of the txo currently being spent.
+# The delegated-staking covenant uses it to name "my own address" without baking
+# the hash into the script.
+sub cmd_inputscripthash($) {
+    my ($state) = @_;
+    return unless $state->ifstate;
+    push @{$state->stack}, $state->tx->in->[$state->input_num]{txo}->scripthash;
+    return undef;
+}
+
+sub _sum_by_scripthash {
+    my %sum;
+    foreach my $txo (@_) {
+        my $scripthash = $txo->scripthash;
+        $sum{$scripthash} //= 0;
+        $sum{$scripthash} += $txo->value;
+    }
+    return \%sum;
+}
+
+# OP_INPUTSVALUE: pop a scripthash, push the total value of the transaction inputs
+# with that scripthash (0 if none). Sums are memoized on the transaction, so
+# repeated queries for the same scripthash cost O(1) and no sigops charge is needed.
+sub cmd_inputsvalue($) {
+    my ($state) = @_;
+    return unless $state->ifstate;
+    my $stack = $state->stack;
+    @$stack or return 0;
+    my $scripthash = pop @$stack;
+    my $tx = $state->tx;
+    my $sum = $tx->{script_inputs_value} //= _sum_by_scripthash(map { $_->{txo} } @{$tx->in});
+    push @$stack, pack_int($sum->{$scripthash} // 0) // return 0;
+    return undef;
+}
+
+# OP_OUTPUTSVALUE: pop a scripthash, push the total value of the transaction outputs
+# paying to that scripthash (0 if none). Together with OP_INPUTSVALUE this expresses
+# the covenant "the value of address X must not decrease in this transaction".
+sub cmd_outputsvalue($) {
+    my ($state) = @_;
+    return unless $state->ifstate;
+    my $stack = $state->stack;
+    @$stack or return 0;
+    my $scripthash = pop @$stack;
+    my $tx = $state->tx;
+    my $sum = $tx->{script_outputs_value} //= _sum_by_scripthash(@{$tx->out});
+    push @$stack, pack_int($sum->{$scripthash} // 0) // return 0;
+    return undef;
+}
+
 sub cmd_exec {
     my ($state) = @_;
     return unless $state->ifstate;
@@ -449,7 +515,10 @@ sub cmd_exec {
     my $script = pop @$stack;
     my $new_state = QBitcoin::Script::State->new($script, $stack, $state->tx, $state->input_num, $state->sigops);
     $new_state->execdepth = $state->execdepth + 1;
-    return execute($new_state);
+    my $res = execute($new_state);
+    return $res if defined $res;
+    $state->sigops = $new_state->sigops;
+    return undef;
 }
 
 # Params: <leaf_hash> <merkle_path> <merkle_root>

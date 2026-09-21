@@ -5,7 +5,7 @@ use feature 'state';
 
 use Time::HiRes;
 use Socket qw(:DEFAULT inet_pton pack_sockaddr_in6 AF_INET6 PF_INET6 IPPROTO_IPV6 IPV6_V6ONLY);
-use Fcntl qw(F_GETFL F_SETFL O_NONBLOCK);
+use POSIX qw(:errno_h);
 use List::Util qw(min);
 use QBitcoin::Const;
 use QBitcoin::Config;
@@ -13,9 +13,10 @@ use QBitcoin::BlockchainParams;
 use QBitcoin::Log;
 use QBitcoin::IP qw(ip_str ip_port_str parse_addr_port sockaddr_to_ip_port pack_sockaddr_by_ip);
 use QBitcoin::Peer;
-use QBitcoin::Connection;
+use QBitcoin::Connection qw(socket_set_blocking);
 use QBitcoin::ConnectionList;
 use QBitcoin::ProtocolState qw(mempool_synced blockchain_synced btc_synced sync_peer last_qbt_data_time);
+use QBitcoin::CheckPoints qw(max_checkpoint_height);
 use QBitcoin::Generate;
 use QBitcoin::Coins;
 use QBitcoin::Produce;
@@ -25,6 +26,7 @@ use QBitcoin::Wallet;
 use QBitcoin::RPC;
 use QBitcoin::REST;
 use QBitcoin::Fork;
+use QBitcoin::Resolver;
 
 sub bind_addr {
     my $class = shift;
@@ -97,6 +99,10 @@ sub listen_socket {
         or die "bind $addr_str error: $!\n";
     listen($socket, LISTEN_QUEUE)
         or die "Error listen: $!\n";
+    # A blocking accept() may hang until the next connection arrives if the pending one was
+    # reset by the client between select() and accept() (see accept(2)); for a rarely used
+    # RPC/REST port that would stall the main loop for a long time
+    socket_set_blocking($socket, 0);
     Infof("Accepting connections on %s", $addr_str);
     return $socket;
 }
@@ -114,10 +120,19 @@ sub connect_to {
         $peer->failed_connect();
         return undef;
     }
-    my $flags = fcntl($socket, F_GETFL, 0)
-        or die "socket get fcntl error: $!\n";
-    fcntl($socket, F_SETFL, $flags | O_NONBLOCK)
-        or die "socket set fcntl error: $!\n";
+    socket_set_blocking($socket, 0);
+    # A non-blocking connect normally returns EINPROGRESS and completes (or fails) later,
+    # reported by select() and SO_ERROR. But it may also fail synchronously, typically with
+    # ENETUNREACH/EHOSTUNREACH when the host has no route to the peer (e.g. an IPv6 peer on a
+    # host that lost its IPv6 connectivity). Such a socket has SO_ERROR == 0 and is reported
+    # writable at once, so it would be mistaken for a connected one; count the failure here so
+    # the backoff (see QBitcoin::Peer::is_connect_allowed) prevents retrying every loop.
+    unless (connect($socket, $paddr) || $!{EINPROGRESS}) {
+        Warningf("Connect to %s peer %s error: %s", $peer->type, $peer->id, $!);
+        close($socket);
+        $peer->failed_connect();
+        return undef;
+    }
     my $connection = QBitcoin::Connection->new(
         peer       => $peer,
         addr       => $peer->ip,
@@ -131,7 +146,6 @@ sub connect_to {
         obj_recv   => 0,
         $opts{probe} ? (probe => 1) : (),
     );
-    connect($socket, $paddr);
     Debugf("Connecting to %s peer %s:%u", $peer->type, $peer->id, $peer->port);
     # do not touch update_time here: it means "last activity of the peer" and anchors the
     # reputation decay; the attempt result is recorded in last_fail_time / last_success_time
@@ -144,15 +158,11 @@ sub main_loop {
 
     local $SIG{PIPE} = 'IGNORE'; # prevent exceptions on write to socket which was closed by remote
 
-    if ($config->{genesis}) {
-        mempool_synced(1);
-        blockchain_synced(1);
-        last_qbt_data_time(time());
-    }
     if (UPGRADE_FINISHED) {
         btc_synced(1);
     }
     # Load last block from database
+    my $height = -1;
     while (my ($block) = QBitcoin::Block->find(-sortby => "height DESC", -limit => 1)) {
         foreach my $tx (@{$block->transactions}) {
             $tx->add_to_cache();
@@ -166,8 +176,14 @@ sub main_loop {
             QBitcoin::Block->max_db_height($block->height - 1);
             next;
         }
-        Debugf("Loaded block height %u", $block->height);
+        $height = $block->height;
+        Debugf("Loaded block height %u", $height);
         last;
+    }
+    if ($config->{genesis} && $height >= max_checkpoint_height()) {
+        mempool_synced(1);
+        blockchain_synced(1);
+        last_qbt_data_time(time());
     }
     # Fill the pubkey column for wallet rows created before it existed (needs the
     # plaintext keys, so it only covers unencrypted rows)
@@ -204,7 +220,7 @@ sub main_loop {
         }
     }
 
-    if ($config->{genesis} && !QBitcoin::Block->blockchain_time) {
+    if ($config->{genesis} && blockchain_synced() && !QBitcoin::Block->blockchain_time) {
         GENESIS_TIME % BLOCK_INTERVAL == 0
             or die "Genesis time " . GENESIS_TIME . " is not a multiple of block interval " . BLOCK_INTERVAL;
         QBitcoin::Generate->generate(GENESIS_TIME);
@@ -222,7 +238,8 @@ sub main_loop {
     $SIG{TERM} = $SIG{INT} = sub { $sig_killed = 1 };
 
     while () {
-        QBitcoin::Fork->reap();
+        QBitcoin::Resolver->process(); # kill overdue hostname checks, start queued ones
+        QBitcoin::Fork->maintain_db_pool();
         QBitcoin::Block->store_blocks();
         my $timeout = SELECT_TIMEOUT;
         if (!$config->{genesis} && !QBitcoin::ConnectionList->connected(PROTOCOL_QBITCOIN)) {
@@ -260,8 +277,11 @@ sub main_loop {
                         # per-slot stake to a block that is about to be outcompeted. Applies
                         # only to the current slot; a past slot (genesis catch-up / forced for
                         # elapsed time) is produced immediately, and genesis (height 0) does not
-                        # reach this path.
-                        my $gen_at = $timeslot == timeslot($time)
+                        # reach this path. A pending contest of a peer block that filled a PAST
+                        # slot is also produced immediately (contest_pending_past): waiting only
+                        # lets the peer branch grow on top of it, and the next received block
+                        # would displace the pending target.
+                        my $gen_at = $timeslot == timeslot($time) && !QBitcoin::Generate->contest_pending_past($timeslot)
                             ? QBitcoin::Generate->gen_time($timeslot) : 0;
                         if (Time::HiRes::time() >= $gen_at) {
                             QBitcoin::Generate->generate($timeslot);
@@ -298,7 +318,7 @@ sub main_loop {
         my @connections = QBitcoin::ConnectionList->list;
         foreach my $connection (@connections) {
             vec($rin, $connection->socket_fileno, 1) = 1 if length($connection->recvbuf) < READ_BUFFER_SIZE && $connection->state != STATE_CONNECTING;
-            vec($win, $connection->socket_fileno, 1) = 1 if $connection->sendbuf || $connection->state == STATE_CONNECTING;
+            vec($win, $connection->socket_fileno, 1) = 1 if length($connection->sendbuf) || $connection->state == STATE_CONNECTING;
         }
 
         $ein = $rin | $win;
@@ -310,9 +330,14 @@ sub main_loop {
             last;
         }
         my $time = time();
+        # Reap finished request handlers right after select(), before accepting new
+        # connections: their connections are detached from the connection list, and
+        # the RPC/REST limits below count them via forked_requests() until reaped
+        QBitcoin::Fork->reap();
 
         foreach my $listen_socket (grep { vec($rin, fileno($_), 1) == 1 } @listen_socket) {
-            my $peerinfo = accept(my $new_socket, $listen_socket);
+            my $peerinfo = accept_connection($listen_socket, my $new_socket)
+                or next;
             my ($remote_port, $peer_addr) = sockaddr_to_ip_port($peerinfo);
             my $peer_ip = ip_str($peer_addr);
             # Do not reject a duplicate IP here: several nodes behind one NAT address may connect
@@ -363,12 +388,16 @@ sub main_loop {
             }
         }
         foreach my $listen_rpc (grep { vec($rin, fileno($_), 1) == 1 } @listen_rpc) {
-            my $peerinfo = accept(my $new_socket, $listen_rpc);
+            my $peerinfo = accept_connection($listen_rpc, my $new_socket)
+                or next;
             my ($remote_port, $peer_addr) = sockaddr_to_ip_port($peerinfo);
             my $peer_ip = ip_str($peer_addr);
-            my @rpc_connections = grep { $_->type_id == PROTOCOL_RPC } QBitcoin::ConnectionList->list();
-            if (@rpc_connections >= ($config->{max_rpc_connections} // MAX_RPC_CONNECTIONS)) {
-                Warningf("Too many RPC connections (%u), reject from %s", scalar(@rpc_connections), $peer_ip);
+            # Requests handed to forked children are detached from the connection list
+            # but each still occupies a client connection, count them too
+            my $rpc_connections = QBitcoin::Fork->forked_requests(PROTOCOL_RPC);
+            $rpc_connections += grep { $_->type_id == PROTOCOL_RPC } QBitcoin::ConnectionList->list();
+            if ($rpc_connections >= ($config->{max_rpc_connections} // MAX_RPC_CONNECTIONS)) {
+                Warningf("Too many RPC connections (%u), reject from %s", $rpc_connections, $peer_ip);
                 close($new_socket);
             }
             else {
@@ -394,12 +423,16 @@ sub main_loop {
             }
         }
         foreach my $listen_rest (grep { vec($rin, fileno($_), 1) == 1 } @listen_rest) {
-            my $peerinfo = accept(my $new_socket, $listen_rest);
+            my $peerinfo = accept_connection($listen_rest, my $new_socket)
+                or next;
             my ($remote_port, $peer_addr) = sockaddr_to_ip_port($peerinfo);
             my $peer_ip = ip_str($peer_addr);
-            my @rest_connections = grep { $_->type_id == PROTOCOL_REST } QBitcoin::ConnectionList->list();
-            if (@rest_connections >= ($config->{max_rest_connections} // MAX_REST_CONNECTIONS)) {
-                Warningf("Too many REST connections (%u), reject from %s", scalar(@rest_connections), $peer_ip);
+            # Requests handed to forked children are detached from the connection list
+            # but each still occupies a client connection, count them too
+            my $rest_connections = QBitcoin::Fork->forked_requests(PROTOCOL_REST);
+            $rest_connections += grep { $_->type_id == PROTOCOL_REST } QBitcoin::ConnectionList->list();
+            if ($rest_connections >= ($config->{max_rest_connections} // MAX_REST_CONNECTIONS)) {
+                Warningf("Too many REST connections (%u), reject from %s", $rest_connections, $peer_ip);
                 close($new_socket);
             }
             else {
@@ -440,7 +473,10 @@ sub main_loop {
             if (vec($rin, $connection->socket_fileno, 1) == 1) {
                 my $n = sysread($connection->socket, my $data, READ_BUFFER_SIZE);
                 if (!defined $n) {
-                    if ($sig_killed) {
+                    if ($! == EAGAIN || $! == EWOULDBLOCK) {
+                        # Spurious readability (e.g. a segment discarded on checksum error), try later
+                    }
+                    elsif ($sig_killed) {
                         Notice("Killed by signal");
                         $connection->disconnect();
                         last;
@@ -451,12 +487,14 @@ sub main_loop {
                         next;
                     }
                     else {
-                        Warningf("Read error from %s peer %s", $connection->type, $connection->ip);
+                        Warningf("Read error from %s peer %s: %s", $connection->type, $connection->ip, $!);
+                        # An outgoing connection broken before the greeting (e.g. reset by the remote
+                        # right after accept) is a failed connect: failed() counts it for the backoff
+                        $connection->failed();
+                        next;
                     }
-                    $connection->disconnect();
-                    next;
                 }
-                if ($n > 0) {
+                elsif ($n > 0) {
                     $connection->recvbuf .= $data;
                     $was_traffic = 1;
                 }
@@ -486,16 +524,24 @@ sub main_loop {
                     $connection->protocol->startup();
                     next;
                 }
+                # Non-blocking socket: writes as much as fits into the kernel buffer, the rest waits
+                # for the next select(); a blocking write would stall here until the whole sendbuf
+                # (up to WRITE_BUFFER_SIZE) is accepted, i.e. until the peer reads it all
                 my $n = syswrite($connection->socket, $connection->sendbuf, length($connection->sendbuf));
                 if (!defined $n) {
-                    if ($sig_killed) {
+                    if ($! == EAGAIN || $! == EWOULDBLOCK) {
+                        # Spurious writability, try later
+                    }
+                    elsif ($sig_killed) {
                         Notice("Interrupted by signal");
                         $connection->disconnect();
                         last;
                     }
-                    Warningf("Write error to %s peer %s", $connection->type, $connection->ip);
-                    $connection->failed();
-                    next;
+                    else {
+                        Warningf("Write error to %s peer %s: %s", $connection->type, $connection->ip, $!);
+                        $connection->failed();
+                        next;
+                    }
                 }
                 elsif ($n > 0) {
                     $connection->sendbuf = $n == length($connection->sendbuf) ? "" : substr($connection->sendbuf, $n);
@@ -537,7 +583,28 @@ sub main_loop {
             }
         }
     }
+    # Do not let global destruction disconnect a pooled connection which a forked child is still using
+    QBitcoin::Fork->close_db_pool();
     return 0;
+}
+
+# accept() on a listening socket reported readable by select(). Returns the packed peer
+# address and sets the accepted socket to non-blocking mode (it is not inherited from the
+# listening socket on Linux). Returns undef if there is nothing to accept after all: the
+# pending connection was reset by the client before we got to it (EAGAIN with a
+# non-blocking listening socket, or ECONNABORTED), or a transient error like EMFILE.
+sub accept_connection {
+    # $_[1] is the caller's socket variable, accept() autovivifies the handle in it
+    my $listen_socket = $_[0];
+    my $peerinfo = accept($_[1], $listen_socket);
+    if (!$peerinfo) {
+        if ($! != EAGAIN && $! != EWOULDBLOCK && $! != ECONNABORTED && $! != EINTR) {
+            Warningf("accept error: %s", $!);
+        }
+        return undef;
+    }
+    socket_set_blocking($_[1], 0);
+    return $peerinfo;
 }
 
 sub set_pinned_peers {

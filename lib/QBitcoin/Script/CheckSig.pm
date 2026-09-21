@@ -3,9 +3,12 @@ use warnings;
 use strict;
 
 use Role::Tiny;
+use QBitcoin::Const;
 use QBitcoin::Crypto qw(check_sig);
 use QBitcoin::Script::Const;
 use QBitcoin::Script::Util qw(pack_int unpack_int);
+use QBitcoin::BlockchainParams;
+use QBitcoin::ProtocolState qw(blockchain_synced);
 
 sub cmd_checksig($) {
     my ($state) = @_;
@@ -38,11 +41,18 @@ sub checkmultisig($) {
     my $stack = $state->stack;
     @$stack >= 1 or return undef;
     my $nkeys = unpack_int(pop @$stack) // return undef;
+    $nkeys >= 0 or return undef;
     @$stack >= $nkeys+1 or return undef;
-    my @pubkeys = splice(@$stack, -$nkeys-1);
+    my @pubkeys;
+    @pubkeys = splice(@$stack, -$nkeys) if $nkeys;
     my $nsig = unpack_int(pop @$stack) // return undef;
+    $nsig >= 0 or return undef;
     @$stack >= $nsig or return undef;
-    my @sig = splice(@$stack, -$nsig-1);
+    my @sig;
+    @sig = splice(@$stack, -$nsig) if $nsig;
+    # Bitcoin compatibility: pop an extra value off the stack (which is CHECKMULTISIG's bug)
+    # @$stack >= 1 or return undef;
+    # pop @$stack eq "" or return undef;
     $nkeys >= $nsig or return 0;
     ($state->sigops -= $nsig) >= 0 or return undef;
     foreach my $sig (@sig) {
@@ -85,7 +95,14 @@ sub check_tx_signature {
     my $sighash_type = unpack('C', $signature);
     my $sign_data = $tx->sign_data($input_num, $sighash_type)
         or return 0;
-    return check_sig($sign_data, substr($signature, 1), $pubkey);
+    my $res = check_sig($sign_data, substr($signature, 1), $pubkey);
+    if (!$res && $tx->is_tokens && (time() < SIGN_TOKEN_HASH_START + BLOCK_INTERVAL*FORCE_BLOCKS || !blockchain_synced())) {
+        $sign_data = $tx->sign_data_legacy($input_num, $sighash_type)
+            or return 0;
+        $res = check_sig($sign_data, substr($signature, 1), $pubkey);
+        $tx->legacy_signature(1) if $res;
+    }
+    return $res;
 }
 
 1;

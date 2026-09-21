@@ -2,8 +2,9 @@ package QBitcoin::HTTP;
 use warnings;
 use strict;
 
-use JSON::XS;
+use Cpanel::JSON::XS;
 use Time::HiRes;
+use POSIX qw(:errno_h);
 use Scalar::Util qw(weaken);
 use HTTP::Request;
 use QBitcoin::Const;
@@ -11,7 +12,10 @@ use QBitcoin::RPC::Const;
 use QBitcoin::Log;
 use QBitcoin::Accessors qw(mk_accessors);
 use QBitcoin::Block;
+use QBitcoin::Generate;
 use QBitcoin::Fork;
+use QBitcoin::ORM qw(db_alive db_failed);
+use QBitcoin::Password::Throttle qw(throttle_key throttle_delay throttle_failure throttle_success);
 
 use constant ATTR => qw(
     ip
@@ -26,7 +30,7 @@ use constant ATTR => qw(
 
 mk_accessors(ATTR);
 
-my $JSON = JSON::XS->new;
+my $JSON = Cpanel::JSON::XS->new;
 
 sub direction() { DIR_IN }
 sub startup()   {}
@@ -63,9 +67,17 @@ sub receive {
     if ($@) {
         my $error = "$@";
         $error =~ s/\s+$//s;
+        if (!QBitcoin::Fork->is_child && !db_alive()) {
+            Critf("Database connection is lost, exiting: %s", $error);
+            die "$error\n";
+        }
         Errf("process_http exception: %s", $error);
         $self->response_error("Internal error", ERR_INTERNAL_ERROR);
         $res = -1;
+    }
+    elsif (!QBitcoin::Fork->is_child && defined(my $db_error = db_failed())) {
+        Critf("Database connection is broken, exiting: %s", $db_error);
+        die "$db_error\n";
     }
     QBitcoin::Fork->finish($self->connection) if QBitcoin::Fork->is_child;
     return $res;
@@ -76,15 +88,49 @@ sub receive {
 # Overridden in QBitcoin::REST and QBitcoin::RPC.
 sub request_is_read_only { 0 }
 
+# Brute-force limit for the wallet password, keyed by the remote address:
+# seconds until the next attempt from this client is allowed, 0 if not locked
+# out. Works in a forked child too, on the state inherited from the master
+sub auth_throttle_delay {
+    my $self = shift;
+    return throttle_delay(throttle_key($self->connection->addr));
+}
+
+# Record a failed wallet-password attempt. A forked child cannot update the
+# master's counters directly, so it flags the failure to be reported via its
+# exit status and recorded by the master in QBitcoin::Fork::reap
+sub register_auth_failure {
+    my $self = shift;
+    if (QBitcoin::Fork->is_child) {
+        QBitcoin::Fork->auth_failure;
+    }
+    else {
+        throttle_failure(throttle_key($self->connection->addr), $self->connection->ip);
+    }
+}
+
+# Reset the failure history after a successful password check. No-op in a
+# forked child (the master would never see the change); a stale counter is
+# harmless and expires by itself
+sub register_auth_success {
+    my $self = shift;
+    throttle_success(throttle_key($self->connection->addr)) unless QBitcoin::Fork->is_child;
+}
+
 sub send {
     my $self = shift;
     my ($data) = @_;
 
     if ($self->connection->sendbuf eq '' && $self->connection->socket) {
+        # Non-blocking socket in the main process: the part which does not fit into the
+        # kernel buffer at once is kept in sendbuf and sent from the main loop.
+        # In a forked child the socket is blocking and the whole response is written here
         my $n = syswrite($self->connection->socket, $data);
         if (!defined($n)) {
-            Warningf("Error write to socket: %s", $!);
-            return -1;
+            if ($! != EAGAIN && $! != EWOULDBLOCK) {
+                Warningf("Error write to socket: %s", $!);
+                return -1;
+            }
         }
         elsif ($n > 0) {
             if ($n < length($data)) {
@@ -117,6 +163,9 @@ sub process_tx {
     if ($tx->fee >= 0) {
         # announce to other peers
         $tx->announce();
+        # A locally-submitted paid transaction must give this node the same chance to
+        # (re)stake the current slot as the announce just gave every peer
+        QBitcoin::Generate->restake_for_tx($tx);
     }
     elsif (!$tx->in_blocks && !$tx->block_height) {
         Debugf("Ignore stake transactions %s not related to any known block", $tx->hash_str);

@@ -1,18 +1,33 @@
 import { useEffect, useState } from 'react';
 import { Alert, Form, Input, InputNumber, Select, message } from 'antd';
 
-import { assessFee, assessTokenFee, parseTokenAmount, useSendTransaction, NATIVE_ASSET_ID } from '@/features/SendTransaction';
+import {
+    assessFee,
+    assessTokenFee,
+    parseNativeAmount,
+    parseTokenAmount,
+    sumUtxoValues,
+    useSendTransaction,
+    NATIVE_ASSET_ID,
+} from '@/features/SendTransaction';
 import { formatTokenAmount } from '@/entities/Token';
 
 import { isAddress, formatSat } from '@/shared/utils';
 import { Button } from '@/shared/ui/Button';
-import { FORM_MAX_WIDTH, COIN_DECIMALS, SAT_PER_COIN } from '@/shared/const/const';
-import { sat2btc } from '@/shared/lib/fmtbtc';
+import { FORM_MAX_WIDTH, COIN_DECIMALS } from '@/shared/const/const';
+import { satToNativeString } from '@/shared/lib/fmtbtc';
+import { useAssetLabel } from '@/shared/lib/network';
 import { brand } from '@/brand';
 
 import { AssetOptionLabel } from './AssetOptionLabel';
 
 import cls from './FirstStep.module.css';
+
+const nativeToSat = (value: string | number | null): bigint | null => {
+    if (value == null || value === '') return null;
+    const parsed = parseNativeAmount(String(value));
+    return parsed.ok ? parsed.value : null;
+};
 
 export const FirstStep = () => {
     const {
@@ -44,10 +59,11 @@ export const FirstStep = () => {
 
     const [form] = Form.useForm();
     const [submittable, setSubmittable] = useState<boolean>(false);
+    const assetLabel = useAssetLabel();
     const values = Form.useWatch([], form);
 
     const assetOptions = [
-        { value: NATIVE_ASSET_ID, label: `${brand.assetLabel} (native)` },
+        { value: NATIVE_ASSET_ID, label: `${assetLabel} (native)` },
         ...Object.entries(tokenTotals).map(([tokenId, total]) => ({
             value: tokenId,
             label: <AssetOptionLabel tokenId={tokenId} total={total} />,
@@ -58,7 +74,7 @@ export const FirstStep = () => {
         if (!isTokenMode) {
             return {
                 value: address,
-                label: `${address} (${addressesData?.[address].balanceFormatted})`,
+                label: `${address} (${formatSat(addressesData?.[address].balance ?? 0n, assetLabel)})`,
             };
         }
         const group = addressesData?.[address]?.tokens?.[assetId];
@@ -82,22 +98,22 @@ export const FirstStep = () => {
 
     useEffect(() => {
         if (!isFeeManual) {
-            form.setFieldValue('fee', suggestedFeeSat > 0 ? sat2btc(suggestedFeeSat) : undefined);
+            form.setFieldValue('fee', suggestedFeeSat > 0n ? satToNativeString(suggestedFeeSat) : undefined);
             form.validateFields(['fee'], { validateOnly: true }).catch(() => {});
         }
     }, [form, suggestedFeeSat, isFeeManual]);
 
     const totalSelectedBalance = selectedAddresses.reduce((total, address) => {
-        return total + (addressesData?.[address]?.balance || 0);
-    }, 0);
+        return total + (addressesData?.[address]?.balance ?? 0n);
+    }, 0n);
 
     // Native available for the fee in token mode: spendable native UTXOs plus
     // the native value carried by the token UTXOs that will be spent anyway.
     const nativeCarriedSat = isTokenMode
-        ? selectedAddresses
-            .flatMap((address) => addressesData?.[address]?.tokens?.[assetId]?.utxos ?? [])
-            .reduce((sum, utxo) => sum + utxo.valueSat, 0)
-        : 0;
+        ? sumUtxoValues(
+            selectedAddresses.flatMap((address) => addressesData?.[address]?.tokens?.[assetId]?.utxos ?? [])
+        )
+        : 0n;
     const nativeAvailableForFeeSat = totalSelectedBalance + nativeCarriedSat;
 
     const feeAssessment = isTokenMode
@@ -135,7 +151,7 @@ export const FirstStep = () => {
                 address: targetAddress,
                 amount: isTokenMode
                     ? (tokenAmount || undefined)
-                    : (amountSat ? sat2btc(amountSat) : undefined),
+                    : (amountSat ? satToNativeString(amountSat) : undefined),
                 addresses: selectedAddresses,
                 changeAddress: changeAddress || undefined,
                 remember: true
@@ -219,14 +235,16 @@ export const FirstStep = () => {
                             required: true, message: 'Please input amount!'
                         },
                         {
-                            type: 'number', message: 'Please input only numbers!'
-                        },
-                        {
-                            validator: async (_, value: number | null) => {
-                                if (!value || value <= 0) {
+                            validator: async (_, value: string | null) => {
+                                if (value == null || value === '') return;
+                                const parsed = parseNativeAmount(String(value));
+                                if (!parsed.ok) {
+                                    if (parsed.error === 'too_many_decimals') {
+                                        await Promise.reject(`Max ${COIN_DECIMALS} decimal places`);
+                                    }
                                     await Promise.reject('Please input a positive amount!');
-                                } else if (selectedAddresses.length && Math.round(value * SAT_PER_COIN) + feeSat > totalSelectedBalance) {
-                                    await Promise.reject(`Amount + fee exceeds balance (${formatSat(totalSelectedBalance)})`);
+                                } else if (selectedAddresses.length && parsed.value + feeSat > totalSelectedBalance) {
+                                    await Promise.reject(`Amount + fee exceeds balance (${formatSat(totalSelectedBalance, assetLabel)})`);
                                 }
                             }
                         }
@@ -237,9 +255,10 @@ export const FirstStep = () => {
                         placeholder="Amount"
                         style={{ width: '100%' }}
                         controls={false}
-                        min={0}
+                        stringMode
+                        min="0"
                         precision={COIN_DECIMALS}
-                        onChange={(value) => setAmountSat(value ? Math.round(value * SAT_PER_COIN) : 0)}
+                        onChange={(value) => setAmountSat(nativeToSat(value) ?? 0n)}
                     />
                 </Form.Item>
             )}
@@ -280,19 +299,24 @@ export const FirstStep = () => {
             <Form.Item
                 label="Network fee:"
                 name="fee"
-                extra={isTokenMode ? `The network fee is always paid in ${brand.assetLabel}.` : undefined}
+                extra={isTokenMode ? `The network fee is always paid in ${assetLabel}.` : undefined}
                 rules={[
                     { required: true, message: 'Please input fee!' },
                     {
-                        validator: async (_, value: number | null) => {
-                            if (value == null) return;
-                            const valueSat = Math.round(Number(value) * SAT_PER_COIN);
-                            if (suggestedFeeSat > 0 && valueSat < suggestedFeeSat) {
-                                await Promise.reject(`Fee is below the network minimum (${formatSat(suggestedFeeSat)})`);
+                        validator: async (_, value: string | null) => {
+                            const valueSat = nativeToSat(value);
+                            if (valueSat === null) {
+                                if (value != null && value !== '') {
+                                    await Promise.reject('Please input a valid fee!');
+                                }
+                                return;
+                            }
+                            if (suggestedFeeSat > 0n && valueSat < suggestedFeeSat) {
+                                await Promise.reject(`Fee is below the network minimum (${formatSat(suggestedFeeSat, assetLabel)})`);
                             }
                             if (isTokenMode && selectedAddresses.length && valueSat > nativeAvailableForFeeSat) {
                                 await Promise.reject(
-                                    `Not enough ${brand.assetLabel} for the fee (available ${formatSat(nativeAvailableForFeeSat)})`
+                                    `Not enough ${assetLabel} for the fee (available ${formatSat(nativeAvailableForFeeSat, assetLabel)})`
                                 );
                             }
                         }
@@ -303,11 +327,12 @@ export const FirstStep = () => {
                 <InputNumber
                     style={{ width: '100%' }}
                     controls={false}
-                    min={0}
+                    stringMode
+                    min="0"
                     precision={COIN_DECIMALS}
-                    step={0.00000001}
+                    step="0.00000001"
                     onChange={(value) => {
-                        setFeeSat(value != null ? Math.round(Number(value) * SAT_PER_COIN) : null);
+                        setFeeSat(nativeToSat(value));
                     }}
                 />
             </Form.Item>

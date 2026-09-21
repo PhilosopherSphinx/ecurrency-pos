@@ -79,7 +79,27 @@ CREATE TABLE `my_address` (
   algo        int unsigned NOT NULL DEFAULT 1,
   staked      int unsigned NOT NULL DEFAULT 0,
   tag_id      integer DEFAULT NULL,
+  deleg_pubkeyhash varbinary(32) DEFAULT NULL, -- hash of the delegate staking pubkey for delegated-staking addresses
   FOREIGN KEY (tag_id) REFERENCES `tag` (id) ON DELETE SET NULL
+);
+
+-- Long-lived staking keys of a delegate node (see QBitcoin::StakingKey); one key
+-- serves any number of delegated-staking addresses and never controls money
+CREATE TABLE `staking_key` (
+  id          integer NOT NULL AUTO_INCREMENT PRIMARY KEY,
+  private_key blob(4096)   NOT NULL, -- WIF, or encrypted with the wallet master key (see QBitcoin::Wallet)
+  pubkey      blob(2048)   NOT NULL,
+  algo        int unsigned NOT NULL DEFAULT 1
+);
+
+-- Addresses delegated to this node for staking (see QBitcoin::Delegation); the
+-- owner keys are not ours, so these addresses are separate from my_address and
+-- do not count towards the wallet balance
+CREATE TABLE `delegation` (
+  address          varchar(255) NOT NULL PRIMARY KEY,
+  staking_key_id   integer      NOT NULL,
+  owner_pubkeyhash varbinary(32) NOT NULL, -- 20 bytes hash160 pre-quantum, 32 bytes hash256 post-quantum
+  FOREIGN KEY (staking_key_id) REFERENCES `staking_key` (id) ON DELETE CASCADE
 );
 
 CREATE TABLE `btc_block` (
@@ -124,6 +144,9 @@ CREATE TABLE `peer` (
   create_time int unsigned NOT NULL,
   update_time int unsigned NOT NULL,
   software varchar(256),
+  hostname varchar(64),
+  hostname_verified smallint unsigned NOT NULL DEFAULT 0,
+  hostname_check_time int unsigned,
   features bigint unsigned NOT NULL DEFAULT 0,
   ping_min_ms int unsigned,
   ping_avg_ms int unsigned,

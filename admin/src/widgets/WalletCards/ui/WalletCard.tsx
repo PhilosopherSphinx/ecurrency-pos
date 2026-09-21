@@ -1,8 +1,8 @@
 import { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { Dropdown, type MenuProps, Modal, Popover, Switch, Tooltip } from 'antd';
+import { Alert, Dropdown, type MenuProps, Modal, Popover, Switch, Tooltip } from 'antd';
 
-import { useGetAddressQuery } from '@/entities/Address';
+import { useGetAddressQuery, addressBalanceSat } from '@/entities/Address';
 import { TokenChip } from '@/entities/Token';
 import type { IMyAddress } from '@/entities/MyAddress';
 
@@ -12,8 +12,8 @@ import { Clipboard } from '@/shared/ui/Clipboard';
 import { NativeCoinIcon } from '@/shared/ui/NativeCoinIcon';
 import { VStack } from '@/shared/ui/Stack';
 import { formatNumber } from '@/shared/utils';
-import { sat2btc } from '@/shared/lib/fmtbtc';
-import { brand } from '@/brand';
+import { satToNativeString } from '@/shared/lib/fmtbtc';
+import { useAssetLabel } from '@/shared/lib/network';
 import {
     BALANCE_POLL_INTERVAL,
     CLIPBOARD_TOOLTIP_TIMEOUT,
@@ -46,6 +46,7 @@ export const WalletCard = (props: WalletCardProps) => {
     const { myAddress, stakedLoading, onStakedChange } = props;
 
     const navigate = useNavigate();
+    const assetLabel = useAssetLabel();
     const [copied, setCopied] = useState(false);
     const [receiveOpen, setReceiveOpen] = useState(false);
 
@@ -54,9 +55,29 @@ export const WalletCard = (props: WalletCardProps) => {
         pollingInterval: BALANCE_POLL_INTERVAL,
     });
 
-    const balanceSat = addressInfo
-        ? addressInfo.chain_stats.funded_txo_sum - addressInfo.chain_stats.spent_txo_sum
-        : 0;
+    const onStakeSwitch = (checked: boolean) => {
+        if (!checked) {
+            onStakedChange(address, false);
+            return;
+        }
+        Modal.confirm({
+            title: 'Enable staking for this address?',
+            okText: 'Enable staking',
+            content: (
+                <Alert
+                    type="warning"
+                    showIcon
+                    message="An address must be staked on one node only. If the same private key
+                        is imported on another node which stakes it too, both will stake the same
+                        outputs - that is equivocation, and the slashing penalty is paid from
+                        these coins."
+                />
+            ),
+            onOk: () => onStakedChange(address, true),
+        });
+    };
+
+    const balanceSat = addressInfo ? addressBalanceSat(addressInfo.chain_stats) : 0n;
     const tokens = Object.entries(addressInfo?.tokens ?? {});
     const visibleTokens = tokens.slice(0, WALLET_TOKEN_CHIP_LIMIT);
     const overflowCount = tokens.length - visibleTokens.length;
@@ -113,13 +134,27 @@ export const WalletCard = (props: WalletCardProps) => {
                         </span>
                         <span className={cls.stakePill}>
                             <span className={cls.stakeLabel}>Staking</span>
-                            <Switch
-                                size="small"
-                                checked={!!myAddress.staked}
-                                loading={stakedLoading}
-                                onChange={(checked) => onStakedChange(address, checked)}
-                            />
+                            <Tooltip
+                                title={myAddress.delegation
+                                    ? myAddress.delegation === 'both'
+                                        ? 'Staked by this node\'s staking key (delegated address)'
+                                        : 'Delegated: staked by the delegate node'
+                                    : undefined}
+                            >
+                                <Switch
+                                    size="small"
+                                    checked={!!myAddress.staked}
+                                    loading={stakedLoading}
+                                    disabled={!!myAddress.delegation}
+                                    onChange={onStakeSwitch}
+                                />
+                            </Tooltip>
                         </span>
+                        {myAddress.delegation && (
+                            <Tooltip title="Delegated staking address: the delegate can only stake the coins, spending needs your key">
+                                <span className={cls.delegPill}>Delegated</span>
+                            </Tooltip>
+                        )}
                     </div>
                 </div>
                 <div className={cls.actions}>
@@ -160,9 +195,9 @@ export const WalletCard = (props: WalletCardProps) => {
                 ) : (
                     <div className={cls.balance}>
                         <span className={cls.amount} translate="no">
-                            {formatNumber(sat2btc(balanceSat), COIN_DECIMALS)}
+                            {formatNumber(satToNativeString(balanceSat), COIN_DECIMALS)}
                         </span>
-                        <span className={cls.unit}>{brand.assetLabel}</span>
+                        <span className={cls.unit}>{assetLabel}</span>
                         <span className={cls.feePill}>Native · fees</span>
                     </div>
                 )}

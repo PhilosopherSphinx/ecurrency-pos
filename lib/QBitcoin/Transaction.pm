@@ -61,6 +61,7 @@ use constant ATTR => qw(
     upgrade_level
     token_hash
     slashing
+    legacy_signature
 );
 
 mk_accessors(keys %{&FIELDS}, ATTR);
@@ -239,7 +240,12 @@ sub receive {
         QBitcoin::Generate::Control->generate_new() if blockchain_synced();
     }
 
-    if ($self->up) {
+    if ($self->up && !skip_scripts()) {
+        # Under the partial validation the lock script of the btc output is not checked (see
+        # Coinbase::deserialize), so the record is not stored here: with the transaction dropped
+        # when the checkpoint is reached, Coinbase::get_new would build our own coinbase
+        # transaction from the record, invalid by the current rules. The record of a confirmed
+        # transaction is stored with the transaction (store).
         $self->up->store; # and update $self->up->tx_out here if already stored
     }
 
@@ -455,13 +461,18 @@ sub cleanup_mempool {
             # its input is "already spent" by the block we mean to slash. Keep it so we
             # can land it by unconfirming that block (see QBitcoin::Generate). Drop only
             # once the target is buried deeper than the slashing window can reorg.
-            my $tip = QBitcoin::Block->blockchain_height // 0;
+            my $db_height = QBitcoin::Block->max_db_height // 0;
             my $buried = 1;
             foreach my $in (@{$tx->in}) {
                 my $out = $in->{txo}->tx_out;
-                my $sp  = $out ? $class->get($out) : undef;
-                my $h   = $sp ? $sp->block_height : undef;
-                if (!defined($h) || $tip - $h <= SLASHING_WINDOW) {
+                if (!$out) {
+                    $buried = 0;
+                    last;
+                }
+                my $spent_tx = $class->get($out)
+                    or next; # Spent transaction not in cache, maybe already confirmed and freed
+                my $h = $spent_tx->block_height;
+                if (!defined($h) || $h > $db_height) {
                     $buried = 0;
                     last;
                 }
@@ -470,6 +481,14 @@ sub cleanup_mempool {
                 Infof("Drop slashing tx %s: target buried beyond the slashing window", $tx->hash_str);
             }
             next;
+        }
+        if ($tx->is_tokens && time() >= SIGN_TOKEN_HASH_START) {
+            if ($tx->legacy_signature && $tx->token_hash) {
+                if ($tx->drop()) {
+                    Infof("Drop legacy-signature token tx %s", $tx->hash_str);
+                }
+                next;
+            }
         }
         my $spent_txo;
         foreach my $in (@{$tx->in}) {
@@ -494,7 +513,7 @@ sub store {
     my $self = shift;
     $self->is_cached or die "store not cached transaction " . $self->hash_str;
     # we are in sql transaction
-    if ($self->is_tokens && $self->token_hash) {
+    if ($self->is_tokens && length($self->token_hash // "")) {
         my ($tokens_tx) = QBitcoin::Transaction->fetch(hash => $self->token_hash);
         $self->token_id = $tokens_tx->{id};
     }
@@ -514,6 +533,7 @@ sub store {
         $txo->store($self);
     }
     if (my $coinbase = $self->up) {
+        $coinbase->store; # if not stored on receive (partial validation)
         $coinbase->store_published($self);
     }
 }
@@ -565,6 +585,14 @@ sub serialize_unsigned {
     return $data;
 }
 
+sub sign_data_legacy {
+    my $self = shift;
+
+    my $data = $self->sign_data(@_) // return undef;
+    $data = substr($data, 0, length($data) - length($self->token_hash)) if $self->is_tokens && $self->token_hash;
+    return $data;
+}
+
 sub sign_data {
     my $self = shift;
     my ($input_num, $sighash_type) = @_;
@@ -597,6 +625,9 @@ sub sign_data {
         }
         # We do not need to sign coinbase transactions
         $$cached_data = $data;
+    }
+    if ($self->is_tokens && length($self->token_hash // "")) {
+        $data .= $self->token_hash;
     }
     if ($self->is_stake) {
         # It's stake tx which signs block, add block info
@@ -631,7 +662,7 @@ sub as_hashref {
 sub input_as_hashref {
     my $in = shift;
     $in->{siglist} or die "Undefined siglist during input_as_hashref";
-    my $redeem_script = $in->{txo}->redeem_script // die "Undefined redeem_script during input_as_hashref";
+    my $redeem_script = $in->{txo}->redeem_script // ""; # Slashing txo has no redeem_script
     my $alg = 0;
     $alg = unpack("xC", $in->{siglist}->[0]) if @{$in->{siglist}} && length($in->{siglist}->[0]) > 1;
     my $hash = $alg & CRYPT_ALGO_POSTQUANTUM ? hash256($redeem_script) : hash160($redeem_script);
@@ -738,8 +769,9 @@ sub deserialize_output {
 sub output_as_hashref {
     my $self = shift;
     my $out = shift;
+    my $value = $out->value;
     my $res = {
-        value   => Math::BigFloat->new($out->value) / DENOMINATOR,
+        value   => Math::BigFloat->new($value) / DENOMINATOR,
         address => $out->address,
     };
     if ($self->is_tokens) {
@@ -791,6 +823,9 @@ sub deserialize {
             $upgrade_level < level_by_total(MAX_VALUE)
                 or return undef;
             $up = deserialize_coinbase($data, $upgrade_level) // return undef;
+            # Below the last checkpoint the lock script is not checked (see Coinbase::deserialize),
+            # take the scripthash from the transaction output as the full validation would require
+            $up->scripthash = $output[0]->{scripthash} if skip_scripts() && $up->scripthash eq ZERO_HASH && @output;
         }
         else {
             $up = unpack("Q<", $data->get(8) // return undef);
@@ -886,7 +921,8 @@ sub load_txo {
 sub calculate_fee {
     my $self = shift;
 
-    $self->fee = sum0(map { $_->{txo}->value } @{$self->in}) + $self->coins_created - sum0(map { $_->value } @{$self->out});
+    # "+0" is needed to avoid rounding float values in case of NV value exists in addition to IV
+    $self->fee = sum0(map { $_->{txo}->value+0 } @{$self->in}) + $self->coins_created - sum0(map { $_->value+0 } @{$self->out});
 }
 
 sub coins_created {
@@ -911,7 +947,7 @@ sub create_outputs {
             data       => $out->{data},
             tx_in      => $hash,
             num        => $num++,
-            $token_hash ? ( token_hash => $token_hash ) : (),
+            length($token_hash // "") ? ( token_hash => $token_hash ) : (),
         });
         push @txo, $txo;
     }
@@ -1100,10 +1136,6 @@ sub validate {
     }
     if ($self->is_slashing) {
         return 0 if skip_scripts();
-        if (time() < SLASHING_START) {
-            Warningf("Slashing transaction %s rejected: slashing not started yet", $self->hash_str);
-            return -1;
-        }
         return $self->validate_slashing;
     }
     # Transaction must contains at least one output (can't spend all inputs as fee)
@@ -1156,6 +1188,16 @@ sub validate {
                 $self->hash_str, $self->fee);
             return -1;
         }
+        if (!skip_scripts()) {
+            # A slashing refund can never be staked (see txo_stakeable)
+            foreach my $in (@{$self->in}) {
+                if (!$class->txo_stakeable($in->{txo})) {
+                    Warningf("Stake transaction %s spends slashing refund %s:%u",
+                        $self->hash_str, $in->{txo}->tx_in_str, $in->{txo}->num);
+                    return -1;
+                }
+            }
+        }
     }
     elsif ($self->is_standard || $self->is_tokens) {
         if ($self->fee < 0) {
@@ -1176,7 +1218,7 @@ sub validate {
         }
         # Is this a token transaction?
         if ($self->is_tokens) {
-            $self->check_tokens_tx() == 0
+            $self->validate_tokens_tx() == 0
                 or return -1;
         }
     }
@@ -1226,6 +1268,18 @@ sub validate_slashing {
                 $self->hash_str, $txo->tx_in_str, $txo->num);
             return -1;
         }
+        # A slashed UTXO must be a stakeable one, so a slashing refund can never be
+        # slashed again. The evidence only proves double-signing, not that the signed
+        # stakes could enter a valid block - so without this rule a malicious delegate
+        # (whose covenant branch only allows spending into a stake) could fabricate
+        # conflicting stake signatures on the refund and grind the owner's coins down
+        # SLASHING_FINE at a time. Together with the stake-input rule above this makes
+        # an owner's standard spend the only way out for a refund.
+        if (!(ref $self)->txo_stakeable($txo)) {
+            Warningf("Slashing transaction %s spends slashing refund %s:%u",
+                $self->hash_str, $txo->tx_in_str, $txo->num);
+            return -1;
+        }
         # The slashed UTXO must really belong to the equivocating signer: the evidence's
         # redeem_script must hash to the real UTXO's scripthash.
         if (!QBitcoin::Slashing->redeem_matches_scripthash($s->{redeem_script}, $txo->scripthash)) {
@@ -1269,6 +1323,14 @@ sub valid_for_block {
                 or return -1;
         }
     }
+    if ($self->is_tokens && $self->token_hash) {
+        if (timeslot($block->time) < SIGN_TOKEN_HASH_START) {
+            return -1 if !$self->legacy_signature;
+        }
+        else {
+            return -1 if $self->legacy_signature;
+        }
+    }
     if (!skip_scripts()) {
         ( $self->min_tx_time // "Inf" ) <= timeslot($block->time)
             or return -1;
@@ -1282,6 +1344,11 @@ sub check_input_script {
     my $self = shift;
     $self->{min_tx_time} = -1;
     $self->{min_tx_block_height} = -1;
+    # Slashing inputs are spent without a signature, so there is no input script to
+    # evaluate (the txo may not even have its redeem_script revealed); the equivocation
+    # evidence is checked by validate_slashing instead. Reached lazily via
+    # min_tx_time()/min_tx_block_height() for a mempool slashing tx.
+    return 0 if $self->is_slashing;
     foreach my $num (0 .. $#{$self->in}) {
         my $in = $self->in->[$num];
         if ($in->{txo}->check_script($in->{siglist}, $self, $num) != 0) {
@@ -1317,6 +1384,19 @@ sub type_by_hash {
     else {
         return undef;
     }
+}
+
+# Can this output be an input of a stake transaction? A slashing refund cannot:
+# equivocation means the staking setup is broken (or a delegate is dishonest), so the
+# punished coins are banned from staking and from repeated slashing (both enforced in
+# validate()) until the owner moves them with a standard spend. An unknown creating tx
+# passes: a real txo implies its transaction is known, only synthetic txos in tests
+# resolve to undef. Memoized on the txo: the answer never changes for a given output.
+sub txo_stakeable {
+    my $class = shift;
+    my ($txo) = @_;
+    return $txo->{stakeable} //=
+        ($class->type_by_hash($txo->tx_in) // 0) == TX_TYPE_SLASHING ? 0 : 1;
 }
 
 sub announce {
@@ -1355,9 +1435,7 @@ sub pre_load {
             $attr->{in} = [];
         }
         else {
-            my @in_txo = $attr->{tx_type} == TX_TYPE_TOKENS
-                ? QBitcoin::TXO->load_stored_token_inputs($attr->{id}, $attr->{hash})
-                : QBitcoin::TXO->load_stored_inputs($attr->{id}, $attr->{hash});
+            my @in_txo = QBitcoin::TXO->load_stored_inputs($attr->{id}, $attr->{hash});
             my @inputs;
             foreach my $txo (@in_txo) {
                 push @inputs, {
@@ -1430,6 +1508,7 @@ sub on_load {
                 $self->hash_str, $self->size // "undef", length($tx_raw_data));
             die "Incorrect size for loaded transaction " . $self->hash_str . ": " . ($self->size // "undef") . " != " . length($tx_raw_data) . "\n";
         }
+        # TODO: set $self->legacy_signature for token transactions confirmed before SIGN_TOKEN_HASH_START
     }
 
     return $self;
@@ -1572,7 +1651,8 @@ sub stake_weight {
                     $self->hash_str, $in->tx_in_str, $in->num);
                 return undef;
             }
-            $weight += $in->value * ((timeslot($block->time) - timeslot($in_block_time)) / BLOCK_INTERVAL);
+            my $value = $in->value; # prevent convertion to float
+            $weight += $value * ((timeslot($block->time) - timeslot($in_block_time)) / BLOCK_INTERVAL);
         }
         # Prevent int64 overflow, too large weight will not give more advantage, so just set it to maximum value
         $weight = MAX_INT64 if $weight > MAX_INT64;
@@ -1760,11 +1840,11 @@ sub min_tx_block_height {
 sub drop_all_pending {
     my $class = shift;
     my ($connection) = @_;
-
+    # without $connection: drop all pending transactions
     foreach my $tx_hash (keys %PENDING_TX_INPUT) {
         my $tx = $PENDING_TX_INPUT{$tx_hash}
             or next;
-        if ($tx->received_from_peer && $tx->received_from->peer->id eq $connection->peer->id) {
+        if (!$connection || $tx->received_from_peer && $tx->received_from->peer->id eq $connection->peer->id) {
             $tx->drop();
         }
     }
@@ -1779,6 +1859,39 @@ sub compare_tx {
         $a->hash cmp $b->hash;
 }
 
+use constant DESC_PACKAGE_TX => 64; # bound for the descendant walk, as MAX_PACKAGE_TX in QBitcoin::Mempool
+
+# Cumulative fee and size of the transaction with its unconfirmed descendants;
+# the walk is bounded, a partial aggregate is enough for eviction ordering
+sub _desc_aggregate {
+    my ($tx) = @_;
+    my ($fee, $size, $count) = (0, 0, 0);
+    my %seen = ($tx->hash => 1);
+    my @stack = ($tx);
+    while (defined(my $t = pop @stack)) {
+        $fee  += $t->fee;
+        $size += $t->size;
+        last if ++$count > DESC_PACKAGE_TX;
+        foreach my $out (@{$t->out}) {
+            foreach my $sp ($out->spent_list) {
+                next if defined $sp->block_height;
+                next if $seen{$sp->hash}++;
+                push @stack, $sp;
+            }
+        }
+    }
+    return ($fee, $size);
+}
+
+# worst first: lowest feerate, then latest received
+sub _cmp_evict {
+    my ($sa, $ta, $sb, $tb) = @_;
+    return
+        $sa->[0] * $sb->[1] <=> $sb->[0] * $sa->[1] ||
+        ($tb->received_time // 0) <=> ($ta->received_time // 0) ||
+        $ta->hash cmp $tb->hash;
+}
+
 sub want_tx {
     my ($tx) = @_;
 
@@ -1790,7 +1903,9 @@ sub want_tx {
         return 0;
     }
 
-    # Reject if mempool over size limit and this tx is not better than worst evictable
+    # Reject if mempool over size limit and this tx is not better than worst evictable.
+    # Admission compares plain feerates (an incoming tx has no descendants yet, and the
+    # worst tx is tracked cheaply); eviction ranks by descendant score, see evict_mempool
     if ($MEMPOOL_SIZE + $tx->size > MAX_MEMPOOL_SIZE) {
         return 0 if $tx->fee == 0;
         my $worst = mempool_worst_tx();
@@ -1808,23 +1923,29 @@ sub want_tx {
 
 sub evict_mempool {
     my @mempool =
-        sort { compare_tx($b, $a) }
         grep { !defined($_->block_height)
                && $_->is_mempool_limited
                && !$_->in_blocks
                && !$_->drop_immune
                && !($_->received_from_peer && $_->received_from->syncing)
         } values %TRANSACTION;
+    # Order by descendant score: the rate of the transaction alone or with all its
+    # unconfirmed descendants, whichever is better. A cheap parent paid for by its
+    # descendants (CPFP) is evicted after single transactions with a lower cumulative
+    # rate; drop() cascades to the descendants, so the whole chain goes together.
+    my %score;
     foreach my $tx (@mempool) {
+        my ($desc_fee, $desc_size) = _desc_aggregate($tx);
+        $score{$tx->hash} = $tx->fee * $desc_size >= $desc_fee * $tx->size
+            ? [ $tx->fee, $tx->size ]
+            : [ $desc_fee, $desc_size ];
+    }
+    foreach my $tx (sort { _cmp_evict($score{$a->hash}, $a, $score{$b->hash}, $b) } @mempool) {
+        last if $MEMPOOL_SIZE <= MAX_MEMPOOL_SIZE && $MEMPOOL_ZERO_FEE_COUNT <= MAX_MEMPOOL_ZERO_FEE_TX;
+        next unless $MEMPOOL_SIZE > MAX_MEMPOOL_SIZE || ($MEMPOOL_ZERO_FEE_COUNT > MAX_MEMPOOL_ZERO_FEE_TX && $tx->fee == 0);
+        next unless $TRANSACTION{$tx->hash}; # already dropped with an evicted ancestor
         Infof("Evict tx %s fee %li size %u from mempool", $tx->hash_str, $tx->fee, $tx->size);
-        if ($MEMPOOL_SIZE > MAX_MEMPOOL_SIZE || ($MEMPOOL_ZERO_FEE_COUNT > MAX_MEMPOOL_ZERO_FEE_TX && $tx->fee == 0)) {
-            if ($tx->drop()) {
-                last if $MEMPOOL_SIZE <= MAX_MEMPOOL_SIZE && $MEMPOOL_ZERO_FEE_COUNT <= MAX_MEMPOOL_ZERO_FEE_TX;
-            }
-        }
-        else {
-            last;
-        }
+        $tx->drop();
     }
 }
 

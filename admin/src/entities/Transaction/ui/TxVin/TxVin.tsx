@@ -5,6 +5,7 @@ import classNames from "classnames";
 import { HStack, VStack } from '@/shared/ui/Stack';
 import { formatNumber } from '@/shared/utils';
 import { moveDecimalPoint } from '@/shared/lib/moveDecimalPoint';
+import { useAssetLabel } from '@/shared/lib/network';
 
 import type { Vin } from '../../model/types/ITransaction.ts';
 
@@ -18,6 +19,7 @@ interface TransactionVinProps {
     index?: number;
     expanded?: boolean;
     highlightAddress?: string;
+    txType?: string;
 }
 
 export const TxVin = memo(function TxVin(props: TransactionVinProps) {
@@ -27,7 +29,10 @@ export const TxVin = memo(function TxVin(props: TransactionVinProps) {
         index,
         expanded,
         highlightAddress,
+        txType,
     } = props;
+
+    const assetLabel = useAssetLabel();
 
     const isHighlighted = highlightAddress && vin.prevout?.scripthash_address === highlightAddress;
 
@@ -38,7 +43,7 @@ export const TxVin = memo(function TxVin(props: TransactionVinProps) {
                     <span className={cls.index}>{`#${index}`}</span>
                     <div className={cls.wrapper}>
                         {description}
-                        <span className={cls.amount}>{vin.prevout && formatOutAmount(vin.prevout)}</span>
+                        <span className={cls.amount}>{vin.prevout && formatOutAmount(vin.prevout, assetLabel)}</span>
                     </div>
                 </HStack>
             </div>
@@ -137,10 +142,17 @@ export const TxVin = memo(function TxVin(props: TransactionVinProps) {
                 <div>{vin.redeem_script}</div>
             </div>}
 
-            {vin.siglist && <div className={cls.vinBodyRow}>
+            {vin.siglist && vin.siglist.length > 0 && <div className={cls.vinBodyRow}>
                 <div>Signatures</div>
                 {vin.siglist.map((signature, index) => <div key={`${signature}_${index}`} className="mono">{signature}</div>)}
             </div>}
+
+            {txType === 'slashing' && vin.redeem_script === '' && (!vin.siglist || vin.siglist.length === 0) &&
+                <div className={cls.vinBodyRow}>
+                    <div>Signature</div>
+                    <div>Spent without a signature (slashing evidence)</div>
+                </div>
+            }
 
             {vin.prevout && <>
                 <div className={cls.vinBodyRow}>

@@ -31,7 +31,7 @@ sub validate {
     # Block time must be exactly on a timeslot boundary: the stake signature commits to
     # timeslot($block->time) (see Block::sign_data), so a sub-slot time would make the
     # signed slot ambiguous and break slashing's "same timeslot" attribution.
-    $block->time == timeslot($block->time)
+    $block->time == timeslot($block->time) || $block->time < SLASHING_START
         or return "Block time " . $block->time . " is not aligned to a timeslot";
     my $merkle_root = $block->calculate_merkle_root;
     $block->merkle_root eq $merkle_root
@@ -84,7 +84,10 @@ sub validate {
     my $upgraded = $block->prev_block ? $block->prev_block->upgraded // 0 : 0;
     my $min_block_fee;
     my $was_standard;
-    foreach my $transaction (@{$block->transactions}) {
+    my $was_slashing;
+    my $can_consume = 1; # Can validator consume transaction fee? No if stake transaction has no inputs
+    for (my $num = 0; $num < @{$block->transactions}; $num++) {
+        my $transaction = $block->transactions->[$num];
         if ($tx_in_block{$transaction->hash}++) {
             return "Transaction " . $transaction->hash_str . " included in the block twice";
         }
@@ -106,6 +109,19 @@ sub validate {
             if ($was_standard && !$config->{regtest}) {
                 return "Coinbase transaction " . $transaction->hash_str . " must not be after standard transaction $was_standard";
             }
+            if ($was_slashing && !$config->{regtest}) {
+                return "Coinbase transaction " . $transaction->hash_str . " must not be after slashing transaction $was_slashing";
+            }
+        }
+        elsif ($transaction->is_slashing) {
+            $fee += $transaction->fee;
+            if ($block->time < SLASHING_START) {
+                return "Slashing transaction " . $transaction->hash_str . " is not allowed before slashing time";
+            }
+            if ($was_standard && !$config->{regtest}) {
+                return "Slashing transaction " . $transaction->hash_str . " must not be after standard transaction $was_standard";
+            }
+            $was_slashing = $transaction->hash_str;
         }
         elsif ($transaction->is_standard || $transaction->is_tokens) {
             $fee += $transaction->fee;
@@ -122,7 +138,7 @@ sub validate {
             $was_standard = $transaction->hash_str;
         }
         elsif ($transaction->is_stake) {
-            if (keys %tx_in_block != 1) {
+            if ($num > 0) {
                 return "Stake transaction " . $transaction->hash_str . " must be the first transaction in the block";
             }
             # Equivocated stake: we hold a slashing tx proving this UTXO signed another
@@ -133,11 +149,18 @@ sub validate {
             }
             $stake_reward = -$transaction->fee; # fee is negative for stake transactions
         }
-        elsif ($transaction->is_slashing && $block->time < SLASHING_START) {
-            return "Slashing transaction " . $transaction->hash_str . " is not allowed before slashing time";
-        }
         else {
             return "Transaction " . $transaction->hash_str . " is not a coinbase, stake or standard transaction";
+        }
+        if (!@{$transaction->in} && !$transaction->coins_created) {
+            if ($num > 0) {
+                return "Transaction " . $transaction->hash_str . " has no inputs";
+            }
+            # Stake transaction without inputs allowed only if the block has no (non-coinbase) transactions with positive fee
+            $can_consume = 0;
+        }
+        elsif (!$can_consume && $transaction->fee > 0 && !$transaction->coins_created) {
+            return "Transaction " . $transaction->hash_str . " has fee but block validator can't consume it";
         }
     }
     # After UPGRADE_FINISHED we can have no btc blocks and do not know when the upgrade was stopped,
@@ -171,7 +194,6 @@ sub validate_chain {
     my $block = shift;
 
     my $fail_tx;
-    my $can_consume = 1; # Can validator consume transaction fee? No if stake transaction has no inputs
     for (my $num = 0; $num < @{$block->transactions}; $num++) {
         my $tx = $block->transactions->[$num];
         if (defined($tx->block_height) && $tx->block_height != $block->height) {
@@ -195,20 +217,6 @@ sub validate_chain {
                     last;
                 }
             }
-        }
-        if (!@{$tx->in} && !$tx->coins_created) {
-            if ($num > 0) {
-                Warningf("Transaction %s has no inputs", $tx->hash_str);
-                $fail_tx = $tx->hash;
-                last;
-            }
-            # Stake transaction without inputs allowed only if the block has no (non-coinbase) transactions with positive fee
-            $can_consume = 0;
-        }
-        elsif (!$can_consume && $tx->fee > 0 && !$tx->coins_created) {
-            Warningf("Transaction %s has fee but block validator can't consume it", $tx->hash_str);
-            $fail_tx = $tx->hash;
-            last;
         }
         if (!skip_scripts()) {
             foreach my $in (@{$tx->in}) {

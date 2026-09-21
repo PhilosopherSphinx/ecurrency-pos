@@ -12,16 +12,20 @@ use QBitcoin::BlockchainParams;
 use QBitcoin::Log;
 use QBitcoin::IP qw(ip_port_str parse_addr_port host_to_ips);
 use QBitcoin::ORM qw(dbh);
-use QBitcoin::Crypto qw(pk_import pk_alg generate_keypair hash160);
+use QBitcoin::Crypto qw(pk_import pk_alg generate_keypair);
 use QBitcoin::Block;
 use QBitcoin::Coins;
 use QBitcoin::Transaction;
 use QBitcoin::ProtocolState qw(mempool_synced blockchain_synced btc_synced);
 use QBitcoin::Transaction;
 use QBitcoin::TXO;
-use QBitcoin::Address qw(wif_to_pk scripthash_by_address address_by_pubkey wallet_import_format address_by_hash);
+use QBitcoin::Address qw(wif_to_pk wif_decode wif_delegation_hash scripthash_by_address address_by_pubkey wallet_import_format delegation_import_format address_by_hash pubkeyhash_str pubkeyhash_by_pubkey);
+use QBitcoin::Script::Delegation qw(delegation_script delegation_address);
 use QBitcoin::MyAddress;
+use QBitcoin::StakingKey;
+use QBitcoin::Delegation;
 use QBitcoin::Password;
+use QBitcoin::Password::Throttle qw(throttle_message);
 use QBitcoin::Wallet;
 use QBitcoin::Tag;
 use QBitcoin::Generate;
@@ -60,6 +64,7 @@ $READONLY{$_} = 1 foreach qw(
     getblock
     getblockhash
     getrawtransaction
+    gettxspendingprevout
     createrawtransaction
     signrawtransactionwithkey
     decoderawtransaction
@@ -81,6 +86,9 @@ $READONLY{$_} = 1 foreach qw(
     listmyaddresses
     getbalance
     estimatesmartfee
+    createdelegationaddress
+    liststakingkeys
+    listdelegations
     gettokensbalance
     gettokensreceived
     gettokensinfo
@@ -117,7 +125,7 @@ Result:
   "total_coins" : n,                      (numeric) total number of generated (upgraded) coins
   "pow_headers" : n,                      (numeric) number of processed ecr-pow block headers
   "pow_scanned" : n,                      (numeric) number of scanned ecr-pow blocks
-  "pow_synced" : true|false,              (bookean) is ecr-pow blockchain fully synced or is in initial block download mode
+  "pow_synced" : true|false,              (boolean) is ecr-pow blockchain fully synced or is in initial block download mode
 }
 
 Examples:
@@ -153,9 +161,9 @@ sub cmd_getblockchaininfo {
                 ($btc_scanned) = Bitcoin::Block->find(scanned => 1, -sortby => 'height DESC', -limit => 1);
             }
         }
-        $response->{pow_synced}  = btc_synced() ? TRUE : FALSE,
-        $response->{pow_headers} = $btc_block   ? $btc_block->height+0   : 0,
-        $response->{pow_scanned} = $btc_scanned ? $btc_scanned->height+0 : 0,
+        $response->{pow_synced}  = btc_synced() ? TRUE : FALSE;
+        $response->{pow_headers} = $btc_block   ? $btc_block->height+0   : 0;
+        $response->{pow_scanned} = $btc_scanned ? $btc_scanned->height+0 : 0;
     }
     return $self->response_ok($response);
 }
@@ -243,7 +251,7 @@ sub cmd_getblockheader {
         hash              => unpack("H*", $block->hash),
         height            => $block->height,
         time              => $block->time,
-        confirmations     => $best_height - $block->height,
+        confirmations     => $best_height - $block->height + 1,
         nTx               => @{$block->tx_hashes}+0,
         previousblockhash => unpack("H*", $block->prev_hash),
         nextblockhash     => $next_block ? unpack("H*", $next_block->hash) : undef,
@@ -327,7 +335,7 @@ sub cmd_getblock {
         hash              => unpack("H*", $block->hash),
         height            => $block->height,
         time              => $block->time,
-        confirmations     => $best_height - $block->height,
+        confirmations     => $best_height - $block->height + 1,
         previousblockhash => unpack("H*", $block->prev_hash // ZERO_HASH),
         nextblockhash     => $next_block ? unpack("H*", $next_block->hash) : undef,
         merkleroot        => unpack("H*", $block->merkle_root),
@@ -433,23 +441,75 @@ sub cmd_getrawtransaction {
     my $res = $tx->as_hashref;
     if (defined $tx->block_height) {
         my $best_height = QBitcoin::Block->blockchain_height;
-        $res->{confirmations} = $best_height - $tx->block_height;
+        $res->{confirmations} = $best_height - $tx->block_height + 1;
         $res->{block_height} = $tx->block_height;
         $res->{block_pos} = $tx->block_pos;
         my $block = QBitcoin::Block->best_block($tx->block_height) // QBitcoin::Block->find(height => $tx->block_height);
         if ($block) {
             my $best_block = QBitcoin::Block->best_block($best_height);
-            $res->{confirm_weight} = $best_block->weight - $block->weight;
+            $res->{confirm_weight} = $best_block->weight - ($block->prev_block ? $block->prev_block->weight : 0);
             $res->{blockhash} = unpack("H*", $block->hash);
             $res->{blocktime} = $block->time;
         }
     }
     else {
-        $res->{confirmations} = -1;
-        $res->{confirm_weight} = -1;
+        $res->{confirmations} = 0;
+        $res->{confirm_weight} = 0;
     }
     return $self->response_ok($res);
 }
+
+$PARAMS{gettxspendingprevout} = "outputs/inputs";
+$HELP{gettxspendingprevout} = qq(
+gettxspendingprevout [{"txid":"hex","vout":n},...]
+
+Scans for transactions spending the given outputs.
+Unlike Bitcoin Core, which checks the mempool only, both the blockchain and
+the mempool are scanned; a confirmed spending transaction takes precedence
+over unconfirmed ones.
+
+Arguments:
+1. outputs                 (json array, required) The transaction outputs that we want to check
+     [
+       {                   (json object)
+         "txid": "hex",    (string, required) The transaction id
+         "vout": n,        (numeric, required) The output number
+       },
+       ...
+     ]
+
+Result:
+[                            (json array)
+  {                          (json object)
+    "txid" : "hex",          (string) the transaction id of the checked output
+    "vout" : n,              (numeric) the vout value of the checked output
+    "spendingtxid" : "hex",  (string, optional) the transaction id of the spending transaction (omitted if unspent)
+  },
+  ...
+]
+
+Examples:
+> qecurrency-cli gettxspendingprevout '[{"txid":"a08e6907dbbd3d809776dbfc5d82e371b764ed838b5655e72f463568df1aadf0","vout":3}]'
+> curl --data-binary '{"jsonrpc": "1.0", "id": "curltest", "method": "gettxspendingprevout", "params": [[{"txid":"a08e6907dbbd3d809776dbfc5d82e371b764ed838b5655e72f463568df1aadf0","vout":3}]]}' -H 'content-type: application/json;' http://127.0.0.1:${\RPC_PORT}/
+);
+sub cmd_gettxspendingprevout {
+    my $self = shift;
+    my @res;
+    foreach my $outpoint (@{$self->args->[0]}) {
+        my $tx = QBitcoin::Transaction->get_by_hash(pack("H*", $outpoint->{txid}))
+            or return $self->response_error("No such mempool or blockchain transaction $outpoint->{txid}", ERR_INVALID_ADDRESS_OR_KEY);
+        my $out = $tx->out->[$outpoint->{vout}]
+            or return $self->response_error("Output index $outpoint->{vout} is out of range for transaction $outpoint->{txid}", ERR_INVALID_PARAMS);
+        my $spent_by = $out->spent_by;
+        push @res, {
+            txid => $outpoint->{txid},
+            vout => $outpoint->{vout} + 0,
+            $spent_by ? ( spendingtxid => unpack("H*", $spent_by) ) : (),
+        };
+    }
+    return $self->response_ok(\@res);
+}
+
 
 $PARAMS{createrawtransaction} = "inputs outputs";
 $HELP{createrawtransaction} = qq(
@@ -564,22 +624,15 @@ sub cmd_sendrawtransaction {
     }
     $tx->received_from = $self;
     if (QBitcoin::Transaction->has_pending($tx->hash)) {
-        return $self->response_error("Transaction already published.", ERR_VERIFY_ALREADY_IN_CHAIN);
+        # Transaction already known, but in pending state
+        return $self->response_error("Some inputs unknown.", ERR_VERIFY_ALREADY_IN_CHAIN);
     }
     if (QBitcoin::Transaction->check_by_hash($tx->hash)) {
-        return $self->response_error("Transaction already published.", ERR_VERIFY_ALREADY_IN_CHAIN);
+        # Transaction already in blockchain, return its hash for idempotency
+        return $self->response_ok(unpack("H*", $tx->hash));
     }
     if (!$tx->load_txo()) {
         return $self->response_error("Incorrect transaction data.", ERR_DESERIALIZATION_ERROR);
-    }
-    # Reject downgrade transactions (outputs to freeze address) when upgrade threshold reached
-    if (my $best_block = QBitcoin::Block->best_block) {
-        if (($best_block->upgraded // 0) >= UPGRADE_MAX_VALUE) {
-            my $freeze_scripthash = hash160(QBT_BURN_SCRIPT);
-            if (grep { $_->scripthash eq $freeze_scripthash && $_->data } @{$tx->out}) {
-                return $self->response_error("Conversion threshold reached, downgrade not accepted.", ERR_INVALID_REQUEST);
-            }
-        }
     }
     if ($tx->is_pending) {
         return $self->response_error("Some inputs unknown.", ERR_VERIFY_ALREADY_IN_CHAIN);
@@ -655,7 +708,8 @@ sub cmd_signrawtransactionwithkey {
     if ($tx->is_pending) {
         return $self->response_error("Some inputs unknown.", ERR_DESERIALIZATION_ERROR);
     }
-    my @address = map { QBitcoin::MyAddress->new(private_key => $_) } @$privkeys;
+    # A dumped delegation WIF carries the delegate pubkeyhash in its payload
+    my @address = map { QBitcoin::MyAddress->new(private_key => $_, deleg_pubkeyhash => wif_delegation_hash($_)) } @$privkeys;
     my @errors;
     my $input_amount = 0;
     foreach my $num (0 .. $#{$tx->in}) {
@@ -663,11 +717,11 @@ sub cmd_signrawtransactionwithkey {
         my $txo = $in->{txo};
         if ($txo->tx_out) {
             # Already confirmed spent
-            return $self->response_error("Input " . $txo->tx_in_str . ":" . $txo->num . " already confirmed spent.", ERR_DESERIALIZATION_ERROR);
+            return $self->response_error(sprintf("Input %s:%u already confirmed spent.", $txo->tx_in_str, $txo->num), ERR_DESERIALIZATION_ERROR);
         }
         elsif (!$txo->unspent && !$replace) {
             # Unconfirmed spent
-            return $self->response_error("Input " . $txo->tx_in_str . ":" . $txo->num . " already spent.", ERR_DESERIALIZATION_ERROR);
+            return $self->response_error(sprintf("Input %s:%u already spent.", $txo->tx_in_str, $txo->num), ERR_DESERIALIZATION_ERROR);
         }
         $input_amount += $txo->value;
         my ($address, $script);
@@ -743,25 +797,27 @@ Arguments:
 1. hexstring    (string, required) The transaction hex string
 
 Result:
-{                           (json object)
-  "txid" : "hex",           (string) The transaction id
-  "size" : n,               (numeric) The transaction size
-  "weight" : n,             (numeric) The transaction's weight (between vsize*4 - 3 and vsize*4)
-  "vin" : [                 (json array)
-    {                       (json object)
-      "txid" : "hex",       (string) The transaction id
-      "vout" : n,           (numeric) The output number
-      "script" : {          (json object) The script
-        "hex" : "hex"       (string) hex
+{                                    (json object)
+  "txid" : "hex",                    (string) The transaction id
+  "hash" : "hex",                    (string) The transaction hash (the same as the txid)
+  "size" : n,                        (numeric) The serialized transaction size
+  "type" : "str",                    (string) The transaction type
+  "in" : [                           (json array)
+    {                                (json object)
+      "txid" : "hex",                (string) The transaction id
+      "num" : n,                     (numeric) The output number
+      "redeem_script" : "hex",       (string, optional) The redeem script in hex
+      "siglist" : [                  (json object) The list of signatures
+        "hex"                        (string) hex
       },
     },
     ...
   ],
-  "vout" : [                (json array)
-    {                       (json object)
-      "value" : n,          (numeric) The amount
-      "n" : n,              (numeric) index
-      "address" : "str"     (string) address
+  "out" : [                          (json array)
+    {                                (json object)
+      "value" : n,                   (numeric) The value in ECR
+      "address" : "str",             (string) ecurrency address
+      "data" : "hex",                (string, optional) The data in hex (if a data output)
     },
     ...
   ]
@@ -1150,6 +1206,10 @@ importprivkey "privkey" ( address_type )
 
 Adds a private key (as returned by dumpprivkey) to your wallet.
 
+A delegation owner key (as returned by getnewaddress with delegate_pubkeyhash)
+is recognized automatically and imports the delegated-staking address it
+controls; no extra arguments are needed.
+
 When the wallet private keys are encrypted the wallet must be unlocked first
 (see walletunlock); the imported key is stored encrypted. Otherwise the key is
 stored in plaintext and the command warns about it.
@@ -1180,7 +1240,7 @@ sub cmd_importprivkey {
     if (QBitcoin::Wallet->is_encrypted && !QBitcoin::Wallet->unlocked) {
         return $self->response_error("The wallet is locked; unlock it with walletunlock first", ERR_WALLET_UNLOCK_NEEDED);
     }
-    my $private_key = wif_to_pk($self->args->[0]);
+    my ($private_key, $delegate_pubkeyhash) = wif_decode($self->args->[0]);
     my $pk_alg = $self->args->[1];
     if (!$pk_alg) {
         ($pk_alg) = pk_alg($private_key)
@@ -1190,17 +1250,24 @@ sub cmd_importprivkey {
         or return $self->response_error("Incorrect private key", ERR_INVALID_ADDRESS_OR_KEY);
     my $pubkey = $privkey->pubkey_by_privkey
         or return $self->response_error("This type of private key is not supported for my_address", ERR_INVALID_ADDRESS_OR_KEY);
-    my $address = address_by_pubkey($pubkey, $pk_alg);
+    my $address = $delegate_pubkeyhash
+        ? delegation_address(pubkeyhash_by_pubkey($pubkey, $pk_alg), $delegate_pubkeyhash)
+        : address_by_pubkey($pubkey, $pk_alg);
     if (grep { $address eq $_->address } QBitcoin::MyAddress->my_address()) {
         return $self->response_ok("Private key for address $address already imported");
     }
-    my $wif = wallet_import_format($private_key);
+    my $wif = $delegate_pubkeyhash
+        ? delegation_import_format($private_key, $delegate_pubkeyhash)
+        : wallet_import_format($private_key);
     my $warning = "";
     if (QBitcoin::Wallet->is_encrypted) {
         $wif = QBitcoin::Wallet->encrypt_pk($wif, $address);
     }
     elsif (!QBitcoin::Password->is_set) {
         $warning = "; WARNING: the key is stored unencrypted, set a wallet password with setwalletpassword to encrypt the wallet keys";
+    }
+    elsif ($config->{encrypted_private_keys} // 1) {
+        $warning = "; WARNING: the key is stored unencrypted, change a wallet password to encrypt the wallet keys";
     }
     else {
         $warning = "; WARNING: the key is stored unencrypted ('encrypted_private_keys' is disabled)";
@@ -1210,6 +1277,7 @@ sub cmd_importprivkey {
         pubkey      => $pubkey,
         address     => $address,
         algo        => $pk_alg,
+        $delegate_pubkeyhash ? (deleg_pubkeyhash => $delegate_pubkeyhash) : (),
     });
     QBitcoin::Generate->load_address_utxo($my_address);
 
@@ -1259,6 +1327,322 @@ sub cmd_importaddress {
     QBitcoin::MyAddress->create(\%attrs);
 
     return $self->response_ok("Watch-only address $address_str imported");
+}
+
+$PARAMS{getnewstakingkey} = "address_type?";
+$HELP{getnewstakingkey} = qq(
+getnewstakingkey ( address_type )
+
+Creates a new staking key for delegated staking and stores it in the wallet.
+A staking key can only sign the stake branch of a delegation covenant; it
+never controls money. Publish the returned pubkeyhash: an owner builds a
+delegated-staking address from it (see getnewaddress) and this node registers
+the address with adddelegationaddress.
+
+When the wallet private keys are encrypted the wallet must be unlocked first
+(see walletunlock); the new key is stored encrypted.
+
+Arguments:
+1. address_type    (string, optional, default="ecdsa") The key type. Options are "ecdsa", "schnorr", "falcon".
+
+Result:
+{
+    "pubkeyhash",  (string) The staking pubkeyhash to publish for the owners
+}
+
+Examples:
+> qecurrency-cli getnewstakingkey
+> curl --data-binary '{"jsonrpc": "1.0", "id": "curltest", "method": "getnewstakingkey", "params": []}' -H 'content-type: application/json;' http://127.0.0.1:${\RPC_PORT}/
+);
+sub cmd_getnewstakingkey {
+    my $self = shift;
+    if (QBitcoin::Wallet->is_encrypted && !QBitcoin::Wallet->unlocked) {
+        return $self->response_error("The wallet is locked; unlock it with walletunlock first", ERR_WALLET_UNLOCK_NEEDED);
+    }
+    my $algo = $self->args->[0] // CRYPT_ALGO_ECDSA;
+    my $keypair = generate_keypair($algo);
+    my $pubkey = $keypair->pubkey_by_privkey
+        or return $self->response_error("This type of key is not supported for staking", ERR_INVALID_ADDRESS_OR_KEY);
+    return $self->_store_staking_key($keypair->pk_serialize, $pubkey, $algo);
+}
+
+$SENSITIVE{importstakingkey} = 1;
+$PARAMS{importstakingkey} = "privkey address_type?";
+$HELP{importstakingkey} = qq(
+importstakingkey "privkey" ( address_type )
+
+Adds a staking key for delegated staking (as returned by dumpstakingkey) to
+the wallet. See getnewstakingkey.
+
+WARNING: a staking key must run on exactly ONE node. If the node you exported
+it from is still staking, two nodes will stake the same delegated outputs -
+that is equivocation, and the slashing penalty is paid from the owners' coins
+entrusted to you. Stop the old node before importing the key here.
+
+Arguments:
+1. privkey        (string, required) The staking private key (an ordinary WIF)
+2. address_type   (string, optional, default from the key) The key type. Options are "ecdsa", "schnorr", "falcon".
+
+Result:
+{
+    "pubkeyhash",  (string) The staking pubkeyhash to publish for the owners
+}
+
+Examples:
+> qecurrency-cli importstakingkey "mykey"
+> curl --data-binary '{"jsonrpc": "1.0", "id": "curltest", "method": "importstakingkey", "params": ["mykey"]}' -H 'content-type: application/json;' http://127.0.0.1:${\RPC_PORT}/
+);
+sub cmd_importstakingkey {
+    my $self = shift;
+    if (QBitcoin::Wallet->is_encrypted && !QBitcoin::Wallet->unlocked) {
+        return $self->response_error("The wallet is locked; unlock it with walletunlock first", ERR_WALLET_UNLOCK_NEEDED);
+    }
+    my ($private_key, $delegate_pubkeyhash) = wif_decode($self->args->[0]);
+    if ($delegate_pubkeyhash) {
+        return $self->response_error("This is a delegation owner key; use importprivkey for it", ERR_INVALID_ADDRESS_OR_KEY);
+    }
+    my $pk_alg = $self->args->[1];
+    if (!$pk_alg) {
+        ($pk_alg) = pk_alg($private_key)
+            or return $self->response_error("Incorrect private key", ERR_INVALID_ADDRESS_OR_KEY);
+    }
+    my $privkey = pk_import($private_key, $pk_alg)
+        or return $self->response_error("Incorrect private key", ERR_INVALID_ADDRESS_OR_KEY);
+    my $pubkey = $privkey->pubkey_by_privkey
+        or return $self->response_error("This type of private key is not supported for staking", ERR_INVALID_ADDRESS_OR_KEY);
+    return $self->_store_staking_key($private_key, $pubkey, $pk_alg);
+}
+
+sub _store_staking_key {
+    my $self = shift;
+    my ($private_key, $pubkey, $algo) = @_;
+    my $pubkeyhash = pubkeyhash_by_pubkey($pubkey, $algo);
+    my $pubkeyhash_str = pubkeyhash_str($pubkeyhash);
+    if (QBitcoin::StakingKey->get_by_pubkeyhash($pubkeyhash)) {
+        return $self->response_ok({ pubkeyhash => $pubkeyhash_str });
+    }
+    my $wif = wallet_import_format($private_key);
+    if (QBitcoin::Wallet->is_encrypted) {
+        $wif = QBitcoin::Wallet->encrypt_pk($wif, $pubkeyhash_str);
+    }
+    my $staking_key = QBitcoin::StakingKey->create({
+        private_key => $wif,
+        pubkey      => $pubkey,
+        algo        => $algo,
+    })
+        or return $self->response_error("Cannot store the staking key", ERR_INTERNAL_ERROR);
+    return $self->response_ok({ pubkeyhash => $pubkeyhash_str });
+}
+
+$PARAMS{dumpstakingkey} = "staking_pubkeyhash/pubkeyhash";
+$REQUIRE_PASSWORD{dumpstakingkey} = 1;
+$HELP{dumpstakingkey} = qq(
+dumpstakingkey "staking_pubkeyhash"
+
+Reveals the staking private key for the given staking pubkeyhash.
+Then the importstakingkey can be used with this output.
+Enabled by 'allow_dumpprivkey' config option.
+
+A staking key must run on exactly ONE node: when moving it, stop this node
+before the new one starts staking, otherwise both will stake the same
+delegated outputs (equivocation, slashed from the owners' coins).
+
+Arguments:
+1. staking_pubkeyhash    (string, required) The staking pubkeyhash (see liststakingkeys)
+
+Result:
+"key"    (string) The staking private key
+
+Examples:
+> qecurrency-cli dumpstakingkey "6nXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
+> curl --data-binary '{"jsonrpc": "1.0", "id": "curltest", "method": "dumpstakingkey", "params": ["6nXXXX"], "password": "mysecret"}' -H 'content-type: application/json;' http://127.0.0.1:${\RPC_PORT}/
+);
+sub cmd_dumpstakingkey {
+    my $self = shift;
+    $config->{allow_dumpprivkey}
+        or return $self->response_error("This command is disabled", ERR_INVALID_ADDRESS_OR_KEY);
+    my $staking_key = QBitcoin::StakingKey->get_by_pubkeyhash($self->args->[0])
+        or return $self->response_error("No such staking key", ERR_INVALID_ADDRESS_OR_KEY);
+    my $stored = $staking_key->private_key;
+    QBitcoin::Wallet->is_encrypted_pk($stored)
+        or return $self->response_ok($stored);
+    my $master; # decrypt_pk defaults to the in-memory master key when unlocked
+    if (!QBitcoin::Wallet->unlocked) {
+        $master = QBitcoin::Wallet->master_key_with_password($self->auth_password // "")
+            or return $self->response_error("Cannot unlock the wallet master key with this password", ERR_WALLET_PASSWORD_INCORRECT);
+    }
+    my $wif = QBitcoin::Wallet->decrypt_pk($stored, $staking_key->pubkeyhash_string, $master)
+        or return $self->response_error("Cannot decrypt the private key", ERR_INTERNAL_ERROR);
+    $self->hide_response = 1;
+    return $self->response_ok($wif);
+}
+
+$PARAMS{liststakingkeys} = "";
+$HELP{liststakingkeys} = qq(
+liststakingkeys
+
+Returns the list of the wallet staking keys for delegated staking.
+
+Result:
+[
+  {
+    "pubkeyhash" : "str",   (string) The staking pubkeyhash (publish it for the owners)
+    "algo" : "str",         (string) Key algorithm
+    "delegations" : n,      (numeric) Number of delegated addresses on this key
+  },
+  ...
+]
+
+Examples:
+> qecurrency-cli liststakingkeys
+> curl --data-binary '{"jsonrpc": "1.0", "id": "curltest", "method": "liststakingkeys", "params": []}' -H 'content-type: application/json;' http://127.0.0.1:${\RPC_PORT}/
+);
+sub cmd_liststakingkeys {
+    my $self = shift;
+    my %delegations;
+    $delegations{$_->staking_key_id}++ foreach QBitcoin::Delegation->list;
+    my @list = map {{
+        pubkeyhash  => $_->pubkeyhash_string,
+        algo        => CRYPT_ALGO_NAMES->{$_->algo},
+        delegations => $delegations{$_->id} // 0,
+    }} QBitcoin::StakingKey->list;
+    return $self->response_ok(\@list);
+}
+
+$PARAMS{createdelegationaddress} = "owner_pubkeyhash/pubkeyhash staking_pubkeyhash/pubkeyhash";
+$HELP{createdelegationaddress} = qq(
+createdelegationaddress "owner_pubkeyhash" "staking_pubkeyhash"
+
+Computes the delegated-staking address for the given owner and delegate
+pubkeyhashes. Stateless: does not touch the wallet; use it to verify that
+both sides derived the same address.
+
+Arguments:
+1. owner_pubkeyhash      (string, required) The owner pubkeyhash
+2. staking_pubkeyhash    (string, required) The delegate staking pubkeyhash
+
+Result:
+{
+    "address",        (string) The delegated-staking address
+    "redeem_script",  (string) The hex-encoded covenant script
+}
+
+Examples:
+> qecurrency-cli createdelegationaddress "6nXXXX" "6nYYYY"
+> curl --data-binary '{"jsonrpc": "1.0", "id": "curltest", "method": "createdelegationaddress", "params": ["6nXXXX", "6nYYYY"]}' -H 'content-type: application/json;' http://127.0.0.1:${\RPC_PORT}/
+);
+sub cmd_createdelegationaddress {
+    my $self = shift;
+    my ($owner_pubkeyhash, $staking_pubkeyhash) = @{$self->args};
+    return $self->response_ok({
+        address       => delegation_address($owner_pubkeyhash, $staking_pubkeyhash),
+        redeem_script => unpack("H*", delegation_script($owner_pubkeyhash, $staking_pubkeyhash)),
+    });
+}
+
+$PARAMS{adddelegationaddress} = "owner_pubkeyhash/pubkeyhash staking_pubkeyhash/pubkeyhash?";
+$HELP{adddelegationaddress} = qq(
+adddelegationaddress "owner_pubkeyhash" ( "staking_pubkeyhash" )
+
+Registers a delegated-staking address on this (delegate) node: the address is
+built from the owner pubkeyhash and a wallet staking key, and its coins are
+staked by this node from now on. The staking key can only return the full
+value back to the address; the block reward is distributed according to the
+reward_addr config option ("reward_addr <address> <share>" keeps the share as
+this node's fee and sends the remainder to the delegated address).
+
+WARNING: a delegated address must be staked by ONE node only. If this staking
+key runs on another node too (a hot spare, an old node left running after a
+migration), both will stake the same outputs - that is equivocation, and the
+slashing penalty is paid from the owner's coins entrusted to you.
+
+Arguments:
+1. owner_pubkeyhash      (string, required) The owner pubkeyhash received from the coins owner
+2. staking_pubkeyhash    (string, optional) The wallet staking key to use; may be omitted when the wallet has exactly one
+
+Result:
+{
+    "address",     (string) The delegated-staking address
+}
+
+Examples:
+> qecurrency-cli adddelegationaddress "6nXXXX"
+> curl --data-binary '{"jsonrpc": "1.0", "id": "curltest", "method": "adddelegationaddress", "params": ["6nXXXX"]}' -H 'content-type: application/json;' http://127.0.0.1:${\RPC_PORT}/
+);
+sub cmd_adddelegationaddress {
+    my $self = shift;
+    my ($owner_pubkeyhash, $staking_pubkeyhash) = @{$self->args};
+    my $staking_key;
+    if ($staking_pubkeyhash) {
+        $staking_key = QBitcoin::StakingKey->get_by_pubkeyhash($staking_pubkeyhash)
+            or return $self->response_error("No such staking key", ERR_INVALID_ADDRESS_OR_KEY);
+    }
+    else {
+        my @keys = QBitcoin::StakingKey->list;
+        @keys == 1
+            or return $self->response_error(@keys ? "More than one staking key in the wallet; specify the staking pubkeyhash" : "No staking key in the wallet; create one with getnewstakingkey", ERR_INVALID_ADDRESS_OR_KEY);
+        $staking_key = $keys[0];
+    }
+    my $delegation = QBitcoin::Delegation->create($staking_key, $owner_pubkeyhash)
+        or return $self->response_error("Cannot store the delegation", ERR_INTERNAL_ERROR);
+    QBitcoin::Generate->load_address_utxo($delegation);
+    return $self->response_ok({ address => $delegation->address });
+}
+
+$PARAMS{removedelegationaddress} = "address";
+$HELP{removedelegationaddress} = qq(
+removedelegationaddress "address"
+
+Stops staking the given delegated-staking address on this node and removes it
+from the wallet. The owner keeps full control of the coins; they just stop
+being staked here.
+
+Arguments:
+1. address    (string, required) The delegated-staking address (see listdelegations)
+
+Result:
+"str"    (string) Result message
+
+Examples:
+> qecurrency-cli removedelegationaddress "3uXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
+);
+sub cmd_removedelegationaddress {
+    my $self = shift;
+    my $address = $self->args->[0];
+    my ($delegation) = grep { $_->address eq $address } QBitcoin::Delegation->list
+        or return $self->response_error("No such delegation address", ERR_INVALID_ADDRESS_OR_KEY);
+    $delegation->remove;
+    return $self->response_ok("Delegation address $address removed");
+}
+
+$PARAMS{listdelegations} = "";
+$HELP{listdelegations} = qq(
+listdelegations
+
+Returns the list of the delegated-staking addresses staked by this node.
+
+Result:
+[
+  {
+    "address" : "str",             (string) The delegated-staking address
+    "owner_pubkeyhash" : "str",    (string) The owner pubkeyhash
+    "staking_pubkeyhash" : "str",  (string) The staking key used for this address
+  },
+  ...
+]
+
+Examples:
+> qecurrency-cli listdelegations
+> curl --data-binary '{"jsonrpc": "1.0", "id": "curltest", "method": "listdelegations", "params": []}' -H 'content-type: application/json;' http://127.0.0.1:${\RPC_PORT}/
+);
+sub cmd_listdelegations {
+    my $self = shift;
+    my @list = map {{
+        address            => $_->address,
+        owner_pubkeyhash   => pubkeyhash_str($_->owner_pubkeyhash),
+        staking_pubkeyhash => $_->staking_key->pubkeyhash_string,
+    }} QBitcoin::Delegation->list;
+    return $self->response_ok(\@list);
 }
 
 $PARAMS{setaddresstag} = "address tag?";
@@ -1330,6 +1714,7 @@ sub cmd_dumpprivkey {
         or return $self->response_error("The address is not correct", ERR_INVALID_ADDRESS_OR_KEY);
     my $my_address = QBitcoin::MyAddress->get_by_hash($scripthash, 0)
         or return $self->response_error("Private key is unknown for this address", ERR_INVALID_ADDRESS_OR_KEY);
+    $self->hide_response = 1;
     my $stored = $my_address->private_key;
     QBitcoin::Wallet->is_encrypted_pk($stored)
         or return $self->response_ok($stored);
@@ -1338,7 +1723,7 @@ sub cmd_dumpprivkey {
         $master = QBitcoin::Wallet->master_key_with_password($self->auth_password // "")
             or return $self->response_error("Cannot unlock the wallet master key with this password", ERR_WALLET_PASSWORD_INCORRECT);
     }
-    my $wif = QBitcoin::Wallet->decrypt_pk($stored, $my_address->address, $master)
+    my $wif = QBitcoin::Wallet->decrypt_pk($stored, $my_address->address_raw, $master)
         or return $self->response_error("Cannot decrypt the private key", ERR_INTERNAL_ERROR);
     return $self->response_ok($wif);
 }
@@ -1352,6 +1737,10 @@ Result:
   {                                   (json object)
     "addr" : "str",                   (string) (host:port) The IP address and port of the peer
     "addrlocal" : "str",              (string) (ip:port) Bind address of the connection to the peer
+    "hostname" : "str",               (string) Human-readable host name of the peer: self-announced in the greeting,
+                                      or the name the peer is configured by. Informational only, never used in any
+                                      logic; an unverified name is an arbitrary claim of the peer, do not trust it
+    "hostname_verified" : true|false, (boolean) The hostname resolves to the peer address (forward-confirmed DNS)
     "network" : "str",                (string) Network (ipv4, ipv6, onion, i2p, not_publicly_routable)
     "createtime" : n,                 (numeric) The connection create time in seconds since epoch
     "bytessent" : n,                  (numeric) The total bytes sent
@@ -1378,6 +1767,8 @@ sub cmd_getpeerinfo {
         push @peers, {
             addr        => ip_port_str($connection->addr, $connection->port),
             addrlocal   => ip_port_str($connection->my_addr, $connection->my_port),
+            hostname    => $peer->display_hostname // "",
+            hostname_verified => $peer->display_hostname_verified ? TRUE : FALSE,
             inbound     => $connection->direction == DIR_IN ? TRUE : FALSE,
             protocol    => $connection->type,
             software    => $peer->software // "",
@@ -1405,9 +1796,11 @@ Result:
 [                                     (json array)
   {                                   (json object)
     "addr" : "str",                   (string) (host:port) The IP address and port of the peer
+    "hostname" : "str",               (string) Human-readable host name of the peer (see getpeerinfo); do not trust an unverified name
+    "hostname_verified" : true|false, (boolean) The hostname resolves to the peer address (forward-confirmed DNS)
     "protocol" : "str",               (string) Protocol (QBitcoin, Bitcoin)
     "connected" : true|false,         (boolean) Whether the peer is currently connected
-    "connect_allowed" : true|false,   (boolean) Whether an outgoing connection to the peer is allowed now (not disabled and not in failed-connects backoff)
+    "connect_allowed" : true|false,   (boolean) Whether an outgoing connection to the peer is allowed now (not disabled, not in failed-connects backoff and the same node is not already connected via another address)
     "reputation" : n,                 (numeric) The peer reputation
     "failed_connects" : n,            (numeric) Number of failed outgoing connects since the last success (see resetpeer)
     "last_success_time" : n,          (numeric) Time of the last successful outgoing handshake, or null if the peer was never verified reachable
@@ -1433,6 +1826,8 @@ sub cmd_listpeers {
         foreach my $peer (sort { $b->reputation <=> $a->reputation || $a->id cmp $b->id } QBitcoin::Peer->get_all($type_id)) {
             push @peers, {
                 addr              => ip_port_str($peer->ip, $peer->port),
+                hostname          => $peer->display_hostname // "",
+                hostname_verified => $peer->display_hostname_verified ? TRUE : FALSE,
                 protocol          => $peer->type,
                 connected         => $peer->conn_state == STATE_CONNECTED ? TRUE : FALSE,
                 connect_allowed   => $peer->is_connect_allowed ? TRUE : FALSE,
@@ -1712,6 +2107,8 @@ Result:
     "staked" : true|false      (boolean) whether the address is used for staking (block validation)
     "watchonly" : true|false   (boolean) whether the address is watch-only (no private key)
     "tag" : "str"|null         (string or null) notification tag for this address
+    "delegation" : "str",      (string, optional) delegated-staking role of this wallet: "owner", "delegate" or "both"
+    "stakeonly" : true         (boolean, optional) only the staking key is here: the address is staked for a foreign owner and is not counted in getbalance
   },
   ...
 }
@@ -1727,11 +2124,30 @@ sub cmd_listmyaddresses {
     my %list;
     foreach my $my_address (QBitcoin::MyAddress->watched_address) {
         next if $my_address->is_watchonly && !$include_watchonly;
+        my $delegation;
+        if (!$my_address->is_watchonly && $my_address->is_delegation) {
+            $delegation = QBitcoin::Delegation->get_by_hash(scalar $my_address->scripthash) ? "both" : "owner";
+        }
         $list{$my_address->address} = {
             algo      => defined($my_address->algo) ? CRYPT_ALGO_NAMES->{$my_address->algo} : undef,
             staked    => $my_address->staked ? TRUE : FALSE,
             watchonly => $my_address->is_watchonly ? TRUE : FALSE,
             tag       => $my_address->tag,
+            $delegation ? (delegation => $delegation) : (),
+        };
+        $list{$my_address->address}{staked} = TRUE if $delegation && $delegation eq "both";
+    }
+    # Addresses delegated to this node whose owner key is elsewhere: staked
+    # here, but not our money (not counted in getbalance)
+    foreach my $delegation (QBitcoin::Delegation->list) {
+        next if $list{$delegation->address};
+        $list{$delegation->address} = {
+            algo       => CRYPT_ALGO_NAMES->{$delegation->staking_key->algo},
+            staked     => TRUE,
+            stakeonly  => TRUE,
+            watchonly  => FALSE,
+            tag        => undef,
+            delegation => "delegate",
         };
     }
     $self->response_ok(\%list);
@@ -1757,7 +2173,13 @@ Result:
   "algo" : "str",               (string, optional) crypto algorithm of the address key (wallet addresses only)
   "staked" : true|false,        (boolean, optional) whether the address is used for staking (wallet addresses only)
   "tag" : "str"|null,           (string or null, optional) notification tag for the address (wallet addresses only)
-  "pubkey" : "hex"              (string, optional) The hex value of the raw public key (if known)
+  "pubkey" : "hex",             (string, optional) The hex value of the raw public key (if known)
+  "pubkeyhash" : "str",         (string, optional) base58 hash of the public key (wallet addresses with a private key)
+  "delegation" : "str",         (string, optional) delegated-staking role of this wallet: "owner", "delegate" or "both"
+  "stakeonly" : true,           (boolean, optional) only the staking key is here: staked for a foreign owner, not counted in getbalance
+  "delegate_pubkeyhash" : "str",(string, optional) the delegate staking pubkeyhash (delegation owner side)
+  "owner_pubkeyhash" : "str",   (string, optional) the owner pubkeyhash (delegation delegate side)
+  "staking_pubkeyhash" : "str"  (string, optional) the staking key used for this address (delegation delegate side)
 }
 
 Examples:
@@ -1776,6 +2198,7 @@ sub cmd_getaddressinfo {
         ismine      => $my_address && !$my_address->is_watchonly ? TRUE : FALSE,
         iswatchonly => $my_address && $my_address->is_watchonly  ? TRUE : FALSE,
     };
+    my $delegation = QBitcoin::Delegation->get_by_hash($scripthash);
     if ($my_address) {
         $res->{algo}   = defined($my_address->algo) ? CRYPT_ALGO_NAMES->{$my_address->algo} : undef;
         $res->{staked} = $my_address->staked ? TRUE : FALSE;
@@ -1783,7 +2206,20 @@ sub cmd_getaddressinfo {
         # pubkey derivation dies for an encrypted key without a stored pubkey while the wallet is locked
         if (my $pubkey = eval { $my_address->pubkey }) {
             $res->{pubkey} = unpack("H*", $pubkey);
+            $res->{pubkeyhash} = pubkeyhash_str(pubkeyhash_by_pubkey($pubkey, $my_address->algo // 0)) unless $my_address->is_watchonly;
         }
+        if (!$my_address->is_watchonly && $my_address->is_delegation) {
+            $res->{delegation} = $delegation ? "both" : "owner";
+            $res->{delegate_pubkeyhash} = pubkeyhash_str($my_address->deleg_pubkeyhash);
+            $res->{staked} = TRUE if $delegation;
+        }
+    }
+    if ($delegation && !$res->{delegation}) {
+        $res->{delegation} = "delegate";
+        $res->{stakeonly}  = TRUE;
+        $res->{staked}     = TRUE;
+        $res->{owner_pubkeyhash}   = pubkeyhash_str($delegation->owner_pubkeyhash);
+        $res->{staking_pubkeyhash} = $delegation->staking_key->pubkeyhash_string;
     }
     return $self->response_ok($res);
 }
@@ -1826,31 +2262,57 @@ sub cmd_getbalance {
     return $self->response_ok(Math::BigFloat->new($value) / DENOMINATOR);
 }
 
-$PARAMS{getnewaddress} = "address_type?";
+$PARAMS{getnewaddress} = "address_type? delegate_pubkeyhash/pubkeyhash?";
 $HELP{getnewaddress} = qq(
-getnewaddress ( address_type )
+getnewaddress ( address_type delegate_pubkeyhash )
 
 Returns a new ecurrency address and private key.
 Private key is not stored in the wallet and can be imported using importprivkey.
 
+With delegate_pubkeyhash (the staking pubkeyhash published by a delegate, see
+getnewstakingkey) the returned address is a delegated-staking address: the
+returned key spends it freely, the delegate's staking key can only stake it
+and must return the full value back to the address. The returned private key
+contains the delegate pubkeyhash, so it alone is enough to import or restore
+the address; the returned "pubkeyhash" is your side of the covenant - send it
+to the delegate so their node can register the address for staking (see
+adddelegationaddress).
+WARNING: the delegate can never spend your coins, but they are the slashing
+collateral: if the delegate's node equivocates (e.g. runs its staking key on
+two nodes at once), the penalty is paid from the address's coins. Choose a
+delegate you trust to operate a single node - the covenant does not protect
+against this, only reputation does.
+
 Arguments:
-1. address_type    (string, optional, default="ecdsa") The address type to use. Options are "ecdsa", "schnorr", "falcon".
+1. address_type          (string, optional, default="ecdsa") The address type to use. Options are "ecdsa", "schnorr", "falcon".
+2. delegate_pubkeyhash   (string, optional) The delegate staking pubkeyhash for a delegated-staking address
 
 Result:
 {
     "address",     (string) The new ecurrency address
     "private_key", (string) The private key for the new address
+    "pubkeyhash",  (string, optional) The owner pubkeyhash to send to the delegate (delegated-staking addresses only)
 }
 
 Examples:
 > qecurrency-cli getnewaddress
+> qecurrency-cli getnewaddress "ecdsa" "6nXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
 > curl --user myusername --data-binary '{"jsonrpc": "1.0", "id": "curltest", "method": "getnewaddress", "params": []}' -H 'content-type: application/json;' http://127.0.0.1:${\RPC_PORT}/
 );
 sub cmd_getnewaddress {
     my $self = shift;
     my $algo = $self->args->[0] // CRYPT_ALGO_ECDSA;
     my $keypair = generate_keypair($algo);
+    if (defined(my $delegate_pubkeyhash = $self->args->[1])) {
+        my $pubkeyhash = pubkeyhash_by_pubkey($keypair->pubkey_by_privkey, $algo);
+        return $self->response_ok({
+            address     => delegation_address($pubkeyhash, $delegate_pubkeyhash),
+            private_key => delegation_import_format($keypair->pk_serialize, $delegate_pubkeyhash),
+            pubkeyhash  => pubkeyhash_str($pubkeyhash),
+        });
+    }
     my $address = address_by_pubkey($keypair->pubkey_by_privkey, $algo);
+    $self->hide_response = 1;
     return $self->response_ok({ address => $address, private_key => wallet_import_format($keypair->pk_serialize) });
 }
 
@@ -1903,6 +2365,12 @@ stakeaddress address
 
 Set address to be used for staking (block validation).
 
+WARNING: an address must be staked on exactly ONE node. If the same private key
+is imported on another node which stakes it too (a hot spare, an old node left
+running after a migration), both nodes will stake the same outputs - that is
+equivocation, and the slashing penalty is paid from these coins. Stop staking
+the address on the other node before enabling it here.
+
 Arguments:
 1. address    (string, required) The ecurrency address to be used for staking.
               Must be already in the wallet (imported using importprivkey).
@@ -1928,7 +2396,11 @@ sub cmd_stakeaddress {
     if ($my_address->staked) {
         return $self->response_ok("Address $address is already using for staking");
     }
-    $my_address->set_stake(1);
+    if ($my_address->is_delegation) {
+        return $self->response_error("Address $address is delegated for staking; staking it here as well would equivocate and lead to slashing", ERR_INVALID_ADDRESS_OR_KEY);
+    }
+    $my_address->set_stake(1)
+        or return $self->response_error("Cannot set address $address for staking", ERR_INTERNAL_ERROR);
     return $self->response_ok("Address $address set for staking");
 }
 
@@ -2152,11 +2624,20 @@ sub cmd_setwalletpassword {
         my $hint = $config->{allow_password_reset} ? "; leave the password input empty if it is forgotten" : "";
         return $self->response_error("Changing the wallet password requires the current one$hint", ERR_WALLET_PASSWORD_REQUIRED);
     }
-    if (defined($old) && QBitcoin::Password->check_password($old)) {
-        if (defined(my $err = QBitcoin::Wallet->change_password($old, $new))) {
-            return $self->response_error($err, ERR_MISC);
+    if (defined($old)) {
+        # Checking the current password is a brute-force oracle like any other,
+        # so it is subject to the same per-source limit (see QBitcoin::RPC)
+        if (my $delay = $self->auth_throttle_delay) {
+            return $self->response_error(throttle_message($delay), ERR_WALLET_PASSWORD_INCORRECT);
         }
-        return $self->response_ok;
+        if (QBitcoin::Password->check_password($old)) {
+            $self->register_auth_success;
+            if (defined(my $err = QBitcoin::Wallet->change_password($old, $new))) {
+                return $self->response_error($err, ERR_MISC);
+            }
+            return $self->response_ok;
+        }
+        $self->register_auth_failure;
     }
     # The current password was not provided or does not match: forgotten-password reset
     if (!$config->{allow_password_reset}) {

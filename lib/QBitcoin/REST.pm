@@ -5,7 +5,10 @@ use strict;
 # Esplora RESTful HTTP API
 # https://github.com/blockstream/esplora/blob/master/API.md
 
-use JSON::XS;
+# Cpanel::JSON::XS (unlike JSON::XS) encodes an integer that was later used in
+# string context as a number, so stale string flags on live objects do not turn
+# numeric fields into JSON strings
+use Cpanel::JSON::XS;
 use Time::HiRes;
 use List::Util qw(sum0);
 use MIME::Base64 qw(decode_base64);
@@ -18,15 +21,19 @@ use QBitcoin::Log;
 use QBitcoin::IP qw(ip_port_str);
 use QBitcoin::Accessors qw(mk_accessors);
 use QBitcoin::ORM qw(dbh);
-use QBitcoin::Address qw(address_by_hash address_by_pubkey wallet_import_format wif_to_pk);
+use QBitcoin::Address qw(address_by_hash address_by_pubkey wallet_import_format wif_to_pk wif_decode delegation_import_format pubkeyhash_str pubkeyhash_by_str pubkeyhash_by_pubkey);
+use QBitcoin::Script::Delegation qw(delegation_address);
 use QBitcoin::MyAddress;
+use QBitcoin::StakingKey;
+use QBitcoin::Delegation;
 use QBitcoin::Password;
+use QBitcoin::Password::Throttle qw(throttle_message);
 use QBitcoin::Wallet;
 use QBitcoin::Transaction;
 use QBitcoin::Block;
 use QBitcoin::TXO;
 use QBitcoin::Utils qw(get_address_txs get_address_utxo address_stats all_tokens_balance get_tokens_txs get_tokens_info create_txo estimate_fees check_tx_tokens_balance);
-use QBitcoin::Crypto qw(pk_import pk_alg generate_keypair hash160);
+use QBitcoin::Crypto qw(pk_import pk_alg generate_keypair);
 use QBitcoin::Generate;
 use QBitcoin::Generate::Control;
 use QBitcoin::ProtocolState qw(blockchain_synced btc_synced);
@@ -37,15 +44,15 @@ use Bitcoin::Serialized;
 use parent qw(QBitcoin::HTTP);
 
 use constant {
-    FALSE => JSON::XS::false,
-    TRUE  => JSON::XS::true,
+    FALSE => Cpanel::JSON::XS::false,
+    TRUE  => Cpanel::JSON::XS::true,
 };
 
 use constant DEBUG_REST => 0;
 
 mk_accessors(qw(cors));
 
-my $JSON = JSON::XS->new;
+my $JSON = Cpanel::JSON::XS->new;
 
 sub type_id() { PROTOCOL_REST }
 
@@ -77,6 +84,12 @@ sub process_request {
     shift @path if @path && $path[0] eq "";
     return $self->http_response(404, "Unknown request") unless @path;
     DEBUG_REST && Debugf("REST request: /%s", join("/", @path));
+    if ($http_request->method eq "POST" && $http_request->decoded_content) {
+        if (lc($http_request->headers->content_type // "") ne "application/json") {
+            DEBUG_REST && Infof("REST request with invalid Content-Type: %s", $http_request->headers->content_type // "");
+            return $self->http_response(400, "Invalid Content-Type");
+        }
+    }
     if ($path[0] eq "api") {
         $self->cors(1);
         shift @path; # remove "api"
@@ -104,16 +117,7 @@ sub process_request {
                     return $self->http_ok($tx->serialize);
                 }
                 elsif ($path[2] eq "outspends") {
-                    my @out;
-                    foreach my $out (@{$tx->out}) {
-                        push @out, {
-                            spent => $out->tx_out ? TRUE : FALSE,
-                            $out->tx_out ? (
-                                txid => unpack("H*", $out->tx_out),
-                            ) : (),
-                        };
-                    }
-                    return $self->http_ok(\@out);
+                    return $self->http_ok([ map { outspend_obj($_) } @{$tx->out} ]);
                 }
                 elsif ($path[2] eq "merkleblock-proof") {
                     return $self->http_response(500, "Unimplemented");
@@ -130,12 +134,9 @@ sub process_request {
             }
             elsif (@path == 4) {
                 if ($path[2] eq "outspend" && $path[3] =~ /^(?:0|[1-9][0-9]*)\z/) {
-                    return $self->http_ok({
-                        spent => $tx->out->[$path[3]]->tx_out ? TRUE : FALSE,
-                        $tx->out->[$path[3]]->tx_out ? (
-                            txid => unpack("H*", $tx->out->[$path[3]]->tx_out),
-                        ) : (),
-                    });
+                    my $out = $tx->out->[$path[3]]
+                        or return $self->http_response(404, "Output not found");
+                    return $self->http_ok(outspend_obj($out));
                 }
                 else {
                     return $self->http_response(404, "Unknown request");
@@ -328,12 +329,18 @@ sub process_request {
         return $self->http_response(404, "Unknown request") unless @path;
         if ($path[0] eq "my_addresses") {
             return $self->http_ok([
-                map +{
-                    address => $_->address,
-                    staked  => $_->staked ? TRUE : FALSE,
-                    algo    => [ map { CRYPT_ALGO_NAMES->{$_} } $_->algo ],
-                    # last_used => ... # TODO
-                }, QBitcoin::MyAddress->my_address()
+                map {
+                    my $delegated = $_->is_delegation
+                        ? (QBitcoin::Delegation->get_by_hash(scalar $_->scripthash) ? "both" : "owner")
+                        : undef;
+                    +{
+                        address => $_->address,
+                        staked  => ($_->staked || ($delegated && $delegated eq "both")) ? TRUE : FALSE,
+                        algo    => [ map { CRYPT_ALGO_NAMES->{$_} } $_->algo ],
+                        $delegated ? (delegation => $delegated) : (),
+                        # last_used => ... # TODO
+                    }
+                } QBitcoin::MyAddress->my_address()
             ]);
         }
         elsif ($path[0] eq "my_address") {
@@ -341,8 +348,24 @@ sub process_request {
                 or return $self->http_response(404, "Unknown request");
             if (@path == 2) {
                 if ($path[1] eq "new") {
+                    my $content = length($http_request->decoded_content // "")
+                        ? eval { $JSON->decode($http_request->decoded_content) } : {};
+                    ref($content) eq "HASH"
+                        or return $self->http_response(400, "Invalid request body");
                     my $algo = CRYPT_ALGO_ECDSA; # TODO: support multiple algorithms
                     my $keypair = generate_keypair($algo);
+                    if (defined(my $delegate_str = $content->{delegate_pubkeyhash})) {
+                        # A delegated-staking address: the new key spends it, the
+                        # delegate's staking key can only stake it (see QBitcoin::Script::Delegation)
+                        my $delegate_pubkeyhash = eval { pubkeyhash_by_str($delegate_str) }
+                            or return $self->http_response(400, "Invalid delegate pubkeyhash");
+                        my $pubkeyhash = pubkeyhash_by_pubkey($keypair->pubkey_by_privkey, $algo);
+                        return $self->http_ok({
+                            address     => delegation_address($pubkeyhash, $delegate_pubkeyhash),
+                            private_key => delegation_import_format($keypair->pk_serialize, $delegate_pubkeyhash),
+                            pubkeyhash  => pubkeyhash_str($pubkeyhash),
+                        });
+                    }
                     my $address = address_by_pubkey($keypair->pubkey_by_privkey, $algo);
                     return $self->http_ok({ address => $address, private_key => wallet_import_format($keypair->pk_serialize) });
                 }
@@ -355,7 +378,8 @@ sub process_request {
                     if (grep { $content->{address} eq $_->address } QBitcoin::MyAddress->my_address()) {
                         return $self->http_ok({ address => $content->{address}, reason => "Address already imported" });
                     }
-                    my $private_key = eval { wif_to_pk($content->{private_key}) }
+                    my ($private_key, $delegate_pubkeyhash) = eval { wif_decode($content->{private_key}) };
+                    $private_key
                         or return $self->http_response(400, "Invalid private key");
                     my @algos = pk_alg($private_key);
                     @algos or return $self->http_response(400, "Unsupported private key algorithm");
@@ -363,14 +387,19 @@ sub process_request {
                     foreach my $algo (@algos) {
                         my $privkey = pk_import($private_key, $algo) or next;
                         my $pub = $privkey->pubkey_by_privkey or next;
-                        if ($content->{address} eq address_by_pubkey($pub, $algo)) {
+                        my $addr = $delegate_pubkeyhash
+                            ? delegation_address(pubkeyhash_by_pubkey($pub, $algo), $delegate_pubkeyhash)
+                            : address_by_pubkey($pub, $algo);
+                        if ($content->{address} eq $addr) {
                             $pk_alg = $algo;
                             $pubkey = $pub;
                             last;
                         }
                     }
                     $pk_alg or return $self->http_response(400, "Private key does not match the address");
-                    my $store = wallet_import_format($private_key);
+                    my $store = $delegate_pubkeyhash
+                        ? delegation_import_format($private_key, $delegate_pubkeyhash)
+                        : wallet_import_format($private_key);
                     my $warning;
                     if (QBitcoin::Wallet->is_encrypted) {
                         my $master; # in-memory master key when unlocked
@@ -386,6 +415,9 @@ sub process_request {
                     elsif (!QBitcoin::Password->is_set) {
                         $warning = "the key is stored unencrypted; set a wallet password to encrypt the wallet keys";
                     }
+                    elsif ($config->{encrypted_private_keys} // 1) {
+                        $warning = "the key is stored unencrypted; change a wallet password to encrypt the wallet keys";
+                    }
                     else {
                         $warning = "the key is stored unencrypted ('encrypted_private_keys' is disabled)";
                     }
@@ -394,6 +426,7 @@ sub process_request {
                         pubkey      => $pubkey,
                         address     => $content->{address},
                         algo        => $pk_alg,
+                        $delegate_pubkeyhash ? (deleg_pubkeyhash => $delegate_pubkeyhash) : (),
                     });
                     QBitcoin::Generate->load_address_utxo($my_address);
                     return $self->http_ok({ address => $my_address->address, $warning ? (warning => $warning) : () });
@@ -415,8 +448,52 @@ sub process_request {
                 if (($my_address->staked && !$content->{staked}) || (!$my_address->staked && $content->{staked})) {
                     $my_address->private_key || !$content->{staked}
                         or return $self->http_response(400, "Cannot set watch-only address as staked");
-                    $my_address->set_stake($content->{staked} ? 1 : 0);
+                    $my_address->set_stake($content->{staked} ? 1 : 0)
+                        or return $self->http_response(400, $my_address->is_delegation
+                            ? "The address is delegated for staking; staking it here as well would equivocate"
+                            : "Cannot change the staked flag");
                 }
+                return $self->http_ok({});
+            }
+            return $self->http_response(404, "Unknown request");
+        }
+        elsif ($path[0] eq "staking_keys") {
+            my %delegations;
+            $delegations{$_->staking_key_id}++ foreach QBitcoin::Delegation->list;
+            return $self->http_ok([
+                map +{
+                    pubkeyhash  => $_->pubkeyhash_string,
+                    algo        => CRYPT_ALGO_NAMES->{$_->algo},
+                    delegations => $delegations{$_->id} // 0,
+                }, QBitcoin::StakingKey->list
+            ]);
+        }
+        elsif ($path[0] eq "staking_key") {
+            $http_request->method eq "POST" && @path == 2 && $path[1] eq "new"
+                or return $self->http_response(404, "Unknown request");
+            return $self->new_staking_key();
+        }
+        elsif ($path[0] eq "delegations") {
+            return $self->http_ok([
+                map +{
+                    address            => $_->address,
+                    owner_pubkeyhash   => pubkeyhash_str($_->owner_pubkeyhash),
+                    staking_pubkeyhash => $_->staking_key->pubkeyhash_string,
+                }, QBitcoin::Delegation->list
+            ]);
+        }
+        elsif ($path[0] eq "delegation") {
+            $http_request->method eq "POST"
+                or return $self->http_response(404, "Unknown request");
+            if (@path == 2 && $path[1] eq "add") {
+                return $self->delegation_add($http_request);
+            }
+            if (@path == 3 && $path[2] eq "remove") {
+                validate_address($path[1])
+                    or return $self->http_response(404, "Unknown request");
+                my ($delegation) = grep { $_->address eq $path[1] } QBitcoin::Delegation->list
+                    or return $self->http_response(404, "Delegation not found");
+                $delegation->remove;
                 return $self->http_ok({});
             }
             return $self->http_response(404, "Unknown request");
@@ -507,14 +584,14 @@ sub wallet_tx_create {
         my $in = $tx->in->[$num];
         my $txo = $in->{txo};
         if ($txo->tx_out) {
-            return $self->http_response(400, "Input " . $txo->tx_in_str . ":" . $txo->num . " already confirmed spent");
+            return $self->http_response(400, sprintf("Input %s:%u already confirmed spent", $txo->tx_in_str, $txo->num));
         }
         if (!$txo->unspent) {
-            return $self->http_response(400, "Input " . $txo->tx_in_str . ":" . $txo->num . " already spent");
+            return $self->http_response(400, sprintf("Input %s:%u already spent", $txo->tx_in_str, $txo->num));
         }
         $input_amount += $txo->value;
         my $address = QBitcoin::MyAddress->get_by_hash($txo->scripthash, 0)
-            or return $self->http_response(400, "Input " . $txo->tx_in_str . ":" . $txo->num . " does not belong to a known address");
+            or return $self->http_response(400, sprintf("Input %s:%u does not belong to a known address", $txo->tx_in_str, $txo->num));
         $address->private_key
             or return $self->http_response(400, "No private key for address " . $address->address);
         $tx->make_sign($in, $address, $num);
@@ -559,23 +636,14 @@ sub tx_send {
     $tx->received_from = $self;
 
     if (QBitcoin::Transaction->has_pending($tx->hash)) {
-        return $self->http_response(400, "Transaction already published");
+        return $self->http_response(400, "Some inputs unknown");
     }
     if (QBitcoin::Transaction->check_by_hash($tx->hash)) {
-        return $self->http_response(400, "Transaction already published");
+        # Already published, return ok for idempotency
+        return $self->http_ok({ txid => unpack("H*", $tx->hash) });
     }
     if (!$tx->load_txo()) {
         return $self->http_response(400, "Incorrect transaction data");
-    }
-
-    # Reject downgrade transactions when upgrade threshold reached
-    if (my $best_block = QBitcoin::Block->best_block) {
-        if (($best_block->upgraded // 0) >= UPGRADE_MAX_VALUE) {
-            my $freeze_scripthash = hash160(QBT_BURN_SCRIPT);
-            if (grep { $_->scripthash eq $freeze_scripthash && $_->data } @{$tx->out}) {
-                return $self->http_response(400, "Conversion threshold reached, downgrade not accepted");
-            }
-        }
     }
 
     if ($tx->is_pending) {
@@ -636,11 +704,11 @@ sub response_error {
 }
 
 sub validate_address {
-    $_[0] =~ ADDRESS_RE;
+    defined($_[0]) && $_[0] =~ ADDRESS_RE;
 }
 
 sub validate_txid {
-    $_[0] =~ /^[0-9a-f]{64}\z/;
+    defined($_[0]) && $_[0] =~ /^[0-9a-f]{64}\z/;
 }
 
 sub tx_status {
@@ -657,6 +725,20 @@ sub tx_status {
     }
 }
 
+# Spending status of a transaction output (esplora-like): confirmed or mempool
+# spending transaction, if any. Only the confirmation flag is reported in status,
+# it is known from the txo itself; loading the spending transaction is not needed.
+sub outspend_obj {
+    my ($out) = @_;
+    my $spent_by = $out->spent_by
+        or return { spent => FALSE };
+    return {
+        spent  => TRUE,
+        txid   => unpack("H*", $spent_by),
+        status => { confirmed => $out->tx_out ? TRUE : FALSE },
+    };
+}
+
 sub block_by_height {
     my ($height) = @_;
     return QBitcoin::Block->best_block($height) // QBitcoin::Block->find(height => $height);
@@ -667,7 +749,8 @@ sub vin_obj {
     my $res = {
         txid          => unpack("H*", $vin->{txo}->tx_in),
         vout          => $vin->{txo}->num,
-        redeem_script => unpack("H*", $vin->{txo}->redeem_script),
+        # Slashing inputs spend without revealing the redeem script, so it may be unknown
+        redeem_script => unpack("H*", $vin->{txo}->redeem_script // ""),
         siglist       => [ map { unpack("H*", $_) } @{$vin->{siglist}} ],
         prevout       => {
             value              => $vin->{txo}->value,
@@ -934,7 +1017,7 @@ sub node_status {
         bestblockhash        => $best_block ? unpack("H*", $best_block->hash) : undef,
         weight               => $best_block ? $best_block->weight+0   : -1,
         bestblocktime        => $best_block ? $best_block->time       : -1,
-        reward               => $best_block ? int($best_block->reward_fund / REWARD_DIVIDER) : 0,
+        reward               => $best_block ? QBitcoin::Block->reward($best_block, 0, $best_block->time + BLOCK_INTERVAL) : 0,
         initialblockdownload => blockchain_synced() ? FALSE : TRUE,
         mempool_size         => @mempool + 0,
         mempool_bytes        => sum0(map { $_->size } @mempool) + 0,
@@ -1002,17 +1085,28 @@ sub check_access {
     my $self = shift;
     my ($http_request) = @_;
     if (QBitcoin::Password->is_set) {
+        # Brute-force limit: while the client is locked out, reject before the
+        # expensive password check, without disclosing whether the password matches
+        if (my $delay = $self->auth_throttle_delay) {
+            return $self->http_throttled($delay);
+        }
         my $auth = $http_request->header('Authorization');
         if (defined($auth) && $auth =~ /^\s*Basic\s+(\S+)/i) {
             my $decoded = eval { decode_base64($1) };
             if (defined($decoded)) {
                 my (undef, $password) = split(/:/, $decoded, 2);
-                if (defined($password) && QBitcoin::Password->check_password($password)) {
-                    # Keep the verified plaintext password for handlers that need
-                    # it as the wallet password (unlock via the staking toggle,
-                    # key encryption on import, password change)
-                    $self->{auth_password} = $password;
-                    return undef;
+                if (defined($password)) {
+                    if (QBitcoin::Password->check_password($password)) {
+                        $self->register_auth_success;
+                        # Keep the verified plaintext password for handlers that need
+                        # it as the wallet password (unlock via the staking toggle,
+                        # key encryption on import, password change)
+                        $self->{auth_password} = $password;
+                        return undef;
+                    }
+                    # A password was presented and did not match; requests without
+                    # credentials (the browser's first request) are not counted
+                    $self->register_auth_failure;
                 }
             }
         }
@@ -1034,6 +1128,22 @@ sub http_auth_required {
     return $self->send($response->as_string("\r\n"));
 }
 
+# The client exceeded the wallet-password attempt limit; sent without checking
+# the password at all, see QBitcoin::Password::Throttle
+sub http_throttled {
+    my $self = shift;
+    my ($delay) = @_;
+    my $body = throttle_message($delay);
+    my $headers = HTTP::Headers->new(
+        Content_Type   => "text/plain",
+        Content_Length => length($body),
+        Retry_After    => $delay,
+    );
+    my $response = HTTP::Response->new(429, "Too Many Requests", $headers, $body);
+    $response->protocol("HTTP/1.1");
+    return $self->send($response->as_string("\r\n"));
+}
+
 sub set_wallet_password {
     my $self = shift;
     my ($http_request) = @_;
@@ -1051,6 +1161,73 @@ sub set_wallet_password {
         return $self->http_response(400, $err);
     }
     return $self->http_ok({});
+}
+
+# POST /wallet/staking_key/new: create a staking key for delegated staking and
+# store it in the wallet; the returned pubkeyhash is what the delegate publishes
+sub new_staking_key {
+    my $self = shift;
+    my $algo = CRYPT_ALGO_ECDSA; # TODO: support multiple algorithms
+    my $keypair = generate_keypair($algo);
+    my $pubkey = $keypair->pubkey_by_privkey
+        or return $self->http_response(500, "Cannot generate a staking key");
+    my $pubkeyhash_str = pubkeyhash_str(pubkeyhash_by_pubkey($pubkey, $algo));
+    my $store = wallet_import_format($keypair->pk_serialize);
+    my $warning;
+    if (QBitcoin::Wallet->is_encrypted) {
+        my $master; # in-memory master key when unlocked
+        if (!QBitcoin::Wallet->unlocked) {
+            # The Basic-auth password of this request is the wallet password
+            $master = defined($self->{auth_password})
+                ? QBitcoin::Wallet->master_key_with_password($self->{auth_password}) : undef
+                or return $self->http_response(409, "The wallet is locked and the master key cannot be unwrapped with the request password");
+        }
+        $store = QBitcoin::Wallet->encrypt_pk($store, $pubkeyhash_str, $master);
+    }
+    elsif (!QBitcoin::Password->is_set) {
+        $warning = "the key is stored unencrypted; set a wallet password to encrypt the wallet keys";
+    }
+    else {
+        $warning = "the key is stored unencrypted ('encrypted_private_keys' is disabled)";
+    }
+    QBitcoin::StakingKey->create({
+        private_key => $store,
+        pubkey      => $pubkey,
+        algo        => $algo,
+    })
+        or return $self->http_response(500, "Cannot store the staking key");
+    return $self->http_ok({ pubkeyhash => $pubkeyhash_str, $warning ? (warning => $warning) : () });
+}
+
+# POST /wallet/delegation/add: register a delegated-staking address on this
+# (delegate) node; its coins are staked by this node from now on
+sub delegation_add {
+    my $self = shift;
+    my ($http_request) = @_;
+    my $content = eval { $JSON->decode($http_request->decoded_content) };
+    ref($content) eq "HASH" && $content->{owner_pubkeyhash}
+        or return $self->http_response(400, "Invalid request body");
+    my $owner_pubkeyhash = eval { pubkeyhash_by_str($content->{owner_pubkeyhash}) }
+        or return $self->http_response(400, "Invalid owner pubkeyhash");
+    my $staking_key;
+    if (defined(my $staking_str = $content->{staking_pubkeyhash})) {
+        my $staking_pubkeyhash = eval { pubkeyhash_by_str($staking_str) }
+            or return $self->http_response(400, "Invalid staking pubkeyhash");
+        $staking_key = QBitcoin::StakingKey->get_by_pubkeyhash($staking_pubkeyhash)
+            or return $self->http_response(404, "No such staking key");
+    }
+    else {
+        my @keys = QBitcoin::StakingKey->list;
+        @keys == 1
+            or return $self->http_response(400, @keys
+                ? "More than one staking key in the wallet; specify the staking pubkeyhash"
+                : "No staking key in the wallet; create one first");
+        $staking_key = $keys[0];
+    }
+    my $delegation = QBitcoin::Delegation->create($staking_key, $owner_pubkeyhash)
+        or return $self->http_response(500, "Cannot store the delegation");
+    QBitcoin::Generate->load_address_utxo($delegation);
+    return $self->http_ok({ address => $delegation->address });
 }
 
 sub wallet_status {

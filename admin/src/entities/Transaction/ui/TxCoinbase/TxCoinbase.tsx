@@ -4,19 +4,21 @@ import { NATIVE_PRECISION } from '@/entities/Transaction/ui/utils';
 
 import { HStack } from '@/shared/ui/Stack';
 import { formatNumber } from '@/shared/utils';
-import { sat2btc } from '@/shared/lib/fmtbtc';
-import { brand } from '@/brand';
+import { satToNativeString } from '@/shared/lib/fmtbtc';
+import type { BaseUnits } from '@/shared/lib/baseUnits';
+import { useAssetLabel } from '@/shared/lib/network';
 
 import cls from './TxCoinbase.module.css';
 
 interface TxCoinbaseProps {
     className?: string;
-    value: number;
+    value: BaseUnits;
     index?: number;
 }
 
 export const TxCoinbase = (props: TxCoinbaseProps) => {
     const { className, value, index } = props;
+    const assetLabel = useAssetLabel();
 
     return (
         <div className={classNames(cls.TxCoinbase, className)}>
@@ -25,7 +27,7 @@ export const TxCoinbase = (props: TxCoinbaseProps) => {
                     <span className={cls.index}>{`#${index}`}</span>
                     <div className={cls.wrapper}>
                         Coinbase
-                        <span className={cls.amount}>{formatNumber(sat2btc(value), NATIVE_PRECISION)}{' '}{brand.assetLabel}</span>
+                        <span className={cls.amount}>{formatNumber(satToNativeString(value), NATIVE_PRECISION)}{' '}{assetLabel}</span>
                     </div>
                 </HStack>
             </div>
