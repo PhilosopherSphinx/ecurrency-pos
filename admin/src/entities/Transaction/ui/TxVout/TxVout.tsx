@@ -4,6 +4,7 @@ import classNames from "classnames";
 
 import { HStack, VStack } from '@/shared/ui/Stack';
 import { moveDecimalPoint } from '@/shared/lib/moveDecimalPoint';
+import { useAssetLabel } from '@/shared/lib/network';
 
 import type { ISpend, Vout } from '../../model/types/ITransaction.ts';
 
@@ -30,6 +31,8 @@ export const TxVout = memo(function TxVout(props: TransactionVoutProps) {
         highlightAddress,
     } = props;
 
+    const assetLabel = useAssetLabel();
+
     const unspendable_types = [ 'op_return', 'provably_unspendable', 'fee' ];
 
     const isHighlighted = highlightAddress && vout.scripthash_address === highlightAddress;
@@ -43,7 +46,7 @@ export const TxVout = memo(function TxVout(props: TransactionVoutProps) {
                         <div className={cls.wrapper}>
                             {description ||'Nonstandard'}
                             <span className={cls.amount}>
-                                {formatOutAmount(vout)}
+                                {formatOutAmount(vout, assetLabel)}
                             </span>
                         </div>
                     </HStack>
@@ -70,6 +73,29 @@ export const TxVout = memo(function TxVout(props: TransactionVoutProps) {
                 <div>script hash (hex)</div>
                 <div className="mono">{vout.scripthash}</div>
             </div>
+
+            { vout.downgrade &&
+                <>
+                    <div className={cls.voutBodyRow}>
+                        <div>reclaim</div>
+                        <div className="mono">
+                            {vout.downgrade.reclaim}
+                        </div>
+                    </div>
+                    { vout.downgrade.reclaim_address &&
+                        <div className={cls.voutBodyRow}>
+                            <div>reclaim address</div>
+                            <div className="mono">{linkToAddr(vout.downgrade.reclaim_address)}</div>
+                        </div>
+                    }
+                    { vout.downgrade.btc_address &&
+                        <div className={cls.voutBodyRow}>
+                            <div>target chain address</div>
+                            <div className="mono">{vout.downgrade.btc_address}</div>
+                        </div>
+                    }
+                </>
+            }
 
             { vout.assetcommitment &&
                 <div className={cls.voutBodyRow}>

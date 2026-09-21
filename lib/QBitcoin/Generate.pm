@@ -14,7 +14,10 @@ use QBitcoin::RedeemScript;
 use QBitcoin::TXO;
 use QBitcoin::Coinbase;
 use QBitcoin::Address qw(scripthash_by_address);
+use QBitcoin::ProtocolState qw(blockchain_synced mempool_synced btc_synced);
 use QBitcoin::MyAddress qw(my_address stake_address);
+use QBitcoin::Delegation;
+use QBitcoin::Wallet::UTXO ();
 use QBitcoin::Transaction;
 use QBitcoin::Crypto qw(hash256);
 use QBitcoin::Slashing;
@@ -27,13 +30,23 @@ sub load_utxo {
     foreach my $my_address (my_address()) {
         $class->load_address_utxo($my_address);
     }
+    foreach my $delegation (QBitcoin::Delegation->list) {
+        $class->load_address_utxo($delegation);
+    }
 }
 
+# Accepts a QBitcoin::MyAddress or a QBitcoin::Delegation (both provide
+# address and scripthash); which utxo registry buckets the outputs go to is
+# decided by the object we load for, so the caller stays the single authority
+# on wallet membership
 sub load_address_utxo {
     my $class = shift;
     my ($my_address) = @_;
     my $count = 0;
     my $value = 0;
+    my $roles = $my_address->isa('QBitcoin::Delegation') ? QBitcoin::Wallet::UTXO::UTXO_DELEGATED
+        : $my_address->can('staked') && $my_address->staked ? QBitcoin::Wallet::UTXO::UTXO_STAKED
+        : QBitcoin::Wallet::UTXO::UTXO_MY;
     my $scripthash = $my_address->scripthash;
     my $chain_utxo = get_address_utxo($my_address->address, 1000);
     foreach my $txid (keys %$chain_utxo) {
@@ -47,7 +60,7 @@ sub load_address_utxo {
                 data       => $utxo_data->{data} // "",
                 defined($utxo_data->{token_id}) ? ( token_hash => $utxo_data->{token_id} ) : (),
             });
-            $utxo->add_my_utxo();
+            QBitcoin::Wallet::UTXO::myutxo_add($utxo, $roles);
             $count++;
             $value += $utxo->value;
         }
@@ -66,21 +79,83 @@ sub gen_time {
     return QBitcoin::Generate::Control->gen_time($timeslot);
 }
 
+# True if the pending contest target (generate_level) is a peer block in a slot earlier
+# than $timeslot. Reacting to it must not wait for the randomized in-slot delay: the
+# delay protects our own current-slot stake commitment from being made too early, while
+# a filled past slot only loses ground while we wait - the peer branch grows on top of
+# it, and the next received block displaces the pending (lower) target. The main loop
+# generates immediately in this case; current-slot targets keep the usual delay.
+sub contest_pending_past {
+    my $class = shift;
+    my ($timeslot) = @_;
+    defined(my $level = QBitcoin::Generate::Control->generate_level)
+        or return 0;
+    my $filled = QBitcoin::Block->best_block($level)
+        or return 0;
+    return $filled->received_from && timeslot($filled->time) < $timeslot ? 1 : 0;
+}
+
+# A new fee-paying transaction can let us claim the current slot's reward: if the best
+# block was received from a peer and carries no stake (a stake can only be the first tx),
+# or the best block is ours (the new fee may be worth a rebuild or a sibling), trigger
+# regeneration via generate_new(). Must be called for every transaction admitted to the
+# mempool whatever its source: a peer (Protocol::process_tx), RPC sendrawtransaction
+# (HTTP::process_tx) or the test producer. A locally-submitted transaction is announced
+# to all peers, so every OTHER validator gets the chance to stake on it; the node it
+# entered through must not be the only one that misses it (2026-08-26, h1855673: an
+# RPC-submitted fee tx 150ms before the slot end was staked by a small validator while
+# we kept the stakeless best block).
+sub restake_for_tx {
+    my $class = shift;
+    my ($tx) = @_;
+    return unless $tx->fee > 0 || $tx->up;
+    return unless blockchain_synced() && mempool_synced();
+    return unless QBitcoin::TXO->staked_utxo;
+    my $best = QBitcoin::Block->best_block
+        or return;
+    if (!$best->received_from || !@{$best->transactions} || !$best->transactions->[0]->is_stake) {
+        QBitcoin::Generate::Control->generate_new();
+    }
+}
+
 sub txo_confirmed {
-    my ($txo) = @_;
+    my ($txo, $max_height) = @_;
     my $block_height = QBitcoin::Transaction->check_by_hash($txo->tx_in)
         or die "No input transaction " . $txo->tx_in_str . " for my utxo\n";
-    return $block_height >= 0;
+    return $block_height >= 0 && $block_height <= $max_height;
+}
+
+# Config "reward_addr <address> [<share>]": the share of the block reward sent
+# to the reward address; the remainder is distributed to the staking addresses
+# by weight, so a delegate keeps the share as its fee and the rest goes to the
+# owners of the delegated addresses (under their covenant). No share means the
+# whole reward goes to the reward address (the historic behavior).
+# Returns [scripthash, share] or undef.
+my %REWARD_CONF;
+sub reward_conf {
+    my $value = $config->{reward_addr}
+        or return undef;
+    return $REWARD_CONF{$value} //= do {
+        my ($address, $share) = grep { length } split /\s+/, $value;
+        $share //= 1;
+        if ($share !~ /^(?:\d+\.?\d*|\.\d+)$/ || $share <= 0 || $share > 1) {
+            Errf("Incorrect reward share %s in reward_addr config, sending the whole reward to %s", $share, $address);
+            $share = 1;
+        }
+        [ scripthash_by_address($address), $share ];
+    };
 }
 
 sub reward_addr {
-    state $reward_addr = $config->{reward_addr} ? scripthash_by_address($config->{reward_addr}) : undef;
-    return $reward_addr;
+    my $conf = reward_conf()
+        or return undef;
+    return $conf->[0];
 }
 
 sub make_out_join {
     my ($reward, $my_txo) = @_;
 
+    @$my_txo or $reward or return ();
     my $my_address;
     if ($config->{sign_alg}) {
         foreach my $sign_alg (split(/\s+/, $config->{sign_alg})) {
@@ -96,24 +171,10 @@ sub make_out_join {
     $my_address //= (stake_address())[0]
         or return ();
     my $my_amount = sum0 map { $_->value } @$my_txo;
-    if (reward_addr) {
-        return (
-            QBitcoin::TXO->new_txo(
-                value      => $my_amount,
-                scripthash => scalar($my_address->scripthash),
-            ),
-            QBitcoin::TXO->new_txo(
-                value      => $reward,
-                scripthash => reward_addr,
-            ),
-        );
-    }
-    else {
-        return QBitcoin::TXO->new_txo(
-            value      => $my_amount + $reward,
-            scripthash => scalar($my_address->scripthash),
-        );
-    }
+    return QBitcoin::TXO->new_txo(
+        value      => $my_amount + $reward,
+        scripthash => scalar($my_address->scripthash),
+    );
 }
 
 sub my_txo_by_address {
@@ -127,8 +188,9 @@ sub my_txo_by_address {
     my %my;
     foreach my $my_txo (@$my_txo) {
         my $my = $my{$my_txo->scripthash} //= [ 0, 0 ];
-        $my->[0] += $my_txo->value;
-        $my->[1] += $my_txo->value * ($time - QBitcoin::Transaction->txo_time($my_txo));
+        my $value = $my_txo->value; # prevent convertion to float in case of large value
+        $my->[0] += $value;
+        $my->[1] += $value * ($time - QBitcoin::Transaction->txo_time($my_txo));
     }
     return (
         sort { $b->[2] <=> $a->[2] || $b->[1] <=> $a->[1] || $a->[0] cmp $b->[0] }
@@ -142,28 +204,15 @@ sub make_out_separate {
     @$my_txo or return make_out_join($reward, $my_txo);
     my ($my_best) = my_txo_by_address($my_txo, $timeslot);
     @$my_txo = grep { $_->scripthash eq $my_best->[0] } @$my_txo;
-    if (reward_addr) {
-        return (
-            QBitcoin::TXO->new_txo(
-                value      => $my_best->[1],
-                scripthash => $my_best->[0],
-            ),
-            QBitcoin::TXO->new_txo(
-                value      => $reward,
-                scripthash => reward_addr,
-            ),
-        );
-    }
-    else {
-        return QBitcoin::TXO->new_txo(
-            value      => $my_best->[1] + $reward,
-            scripthash => $my_best->[0],
-        );
-    }
+    return QBitcoin::TXO->new_txo(
+        value      => $my_best->[1] + $reward,
+        scripthash => $my_best->[0],
+    );
 }
 
 sub make_out_union {
     my ($reward, $my_txo, $timeslot) = @_;
+    @$my_txo or $reward or return ();
     my @my;
     if (!@$my_txo) {
         # Reward to all stake addresses in equal parts
@@ -173,70 +222,99 @@ sub make_out_union {
         @my = my_txo_by_address($my_txo, $timeslot);
     }
     my @out;
-    if (reward_addr) {
-        @out = map {
-            QBitcoin::TXO->new_txo(
-                value      => $_->[1],
-                scripthash => $_->[0],
-            )
-        } @my;
+    my $total_weight = sum0 map { $_->[2] } @my;
+    my $reward_remain = $reward;
+    my %remove_scripthash;
+    for (my $i = $#my; $i >= 0; $i--) {
+        my $reward_part = $i > 0 ? int($reward * $my[$i]->[2] / $total_weight + 0.5) : $reward_remain;
+        if ($reward > 0 && $reward_part == 0) {
+            # Remove utxo related to this address from the @$my_txo list
+            $remove_scripthash{$my[$i]->[0]} = 1;
+            next;
+        }
+        $reward_remain -= $reward_part;
         push @out, QBitcoin::TXO->new_txo(
-            value      => $reward,
-            scripthash => reward_addr,
+            value      => $my[$i]->[1] + $reward_part,
+            scripthash => $my[$i]->[0],
         );
     }
-    else {
-        my $total_weight = sum0 map { $_->[2] } @my;
-        my $reward_remain = $reward;
-        my %remove_scripthash;
-        for (my $i = $#my; $i >= 0; $i--) {
-            my $reward_part = $i > 0 ? int($reward * $my[$i]->[2] / $total_weight + 0.5) : $reward_remain;
-            if ($reward > 0 && $reward_part == 0) {
-                # Remove utxo related to this address from the @$my_txo list
-                $remove_scripthash{$my[$i]->[0]} = 1;
-                next;
-            }
-            $reward_remain -= $reward_part;
-            push @out, QBitcoin::TXO->new_txo(
-                value      => $my[$i]->[1] + $reward_part,
-                scripthash => $my[$i]->[0],
-            );
-        }
-        if (%remove_scripthash) {
-            # Remove utxo related to this address from the @$my_txo list
-            @$my_txo = grep { !$remove_scripthash{$_->scripthash} } @$my_txo;
-        }
+    if (%remove_scripthash) {
+        # Remove utxo related to this address from the @$my_txo list
+        @$my_txo = grep { !$remove_scripthash{$_->scripthash} } @$my_txo;
     }
     return @out;
 }
 
 sub make_stake_tx {
-    my ($reward, $block_sign_data, $timeslot) = @_;
+    my ($reward, $block_sign_data, $timeslot, $prev_height) = @_;
     # Exclude UTXOs we have already published a stake with in this timeslot: re-using
     # them would self-equivocate. The free (still-unused) UTXOs remain available, so in
     # "separate" reward mode a later call can build a second, independent stake with a
     # different address in the same slot - as if it were another node (see generate()).
+    # Only UTXOs confirmed in the prev_block chain (height <= $prev_height) are
+    # spendable: sibling and contest blocks replace the best blocks above that height,
+    # so outputs confirmed there (e.g. our own just-published stake outputs) do not
+    # exist in the branch being built. Including them also broke the reward split:
+    # their age in the block's own slot is 0, making the total stake weight 0.
+    # Slashing refunds are not stakeable (consensus, see Transaction::txo_stakeable): a
+    # slashed node must stop staking these coins instead of building invalid blocks.
     my @my_txo = grep {
-        txo_confirmed($_) && !QBitcoin::Generate::Control->is_utxo_published($timeslot, $_->key)
+        QBitcoin::Transaction->txo_stakeable($_) && txo_confirmed($_, $prev_height)
+            && !QBitcoin::Generate::Control->is_utxo_published($timeslot, $_->key)
     } QBitcoin::TXO->staked_utxo();
     my $reward_to = $config->{reward_to} // "union";
-    my @out;
-    if ($reward_to eq "join") {
-        @out = make_out_join($reward, \@my_txo);
-    }
-    elsif ($reward_to eq "separate") {
-        @out = make_out_separate($reward, \@my_txo, $timeslot);
-    }
-    elsif ($reward_to eq "union") {
-        @out = make_out_union($reward, \@my_txo, $timeslot);
-    }
-    elsif ($reward_to eq "none") {
+    if ($reward_to eq "none") {
         return undef;
     }
-    else {
+    elsif ($reward_to ne "join" && $reward_to ne "separate" && $reward_to ne "union") {
         Errf("Unknown reward_to %s, disable block validation", $reward_to);
         $config->{reward_to} = "none";
         return undef;
+    }
+
+    # The reward-address cut goes first; the remainder is distributed to the
+    # staking addresses. Union and separate need no delegation special-casing:
+    # each address gets a single output of its full input value plus its part
+    # of the remainder, which satisfies the delegation covenant by itself.
+    my @out;
+    my $reward_rest = $reward;
+    if (my $reward_conf = reward_conf()) {
+        my ($reward_scripthash, $share) = @$reward_conf;
+        my $reward_cut = $share >= 1 ? $reward : int($reward * $share + 0.5);
+        push @out, QBitcoin::TXO->new_txo(
+            value      => $reward_cut,
+            scripthash => $reward_scripthash,
+        );
+        $reward_rest = $reward - $reward_cut;
+    }
+
+    if ($reward_to eq "join") {
+        # Delegated outputs cannot be joined: the covenant requires each
+        # delegated scripthash to receive its full input value back
+        my @delegated_txo = grep { $_->is_delegated } @my_txo;
+        my @own_txo       = grep { !$_->is_delegated } @my_txo;
+        my @join_out = make_out_join($reward_rest, \@own_txo);
+        if (@join_out) {
+            push @out, @join_out;
+            push @out, map {
+                QBitcoin::TXO->new_txo(
+                    value      => $_->[1],
+                    scripthash => $_->[0],
+                )
+            } my_txo_by_address(\@delegated_txo, $timeslot);
+            @my_txo = (@own_txo, @delegated_txo);
+        }
+        else {
+            # No own stake address to join to; distribute the remainder over
+            # the delegated addresses so no part of the reward is lost
+            push @out, make_out_union($reward_rest, \@my_txo, $timeslot);
+        }
+    }
+    elsif ($reward_to eq "separate") {
+        push @out, make_out_separate($reward_rest, \@my_txo, $timeslot);
+    }
+    else { # union
+        push @out, make_out_union($reward_rest, \@my_txo, $timeslot);
     }
 
     my $tx = QBitcoin::Transaction->new(
@@ -253,12 +331,13 @@ sub make_stake_tx {
 }
 
 # Is there an uncommitted, weight-increasing transaction in the mempool? Only such a
-# transaction (coinbase / burn / downgrade / slashing - not a plain fee) can make a
+# transaction (coinbase / slashing - not a plain fee) can make a
 # sibling block built with a smaller free stake address outweigh our already-published
 # block, so we build a sibling only when one is pending.
 sub _have_weight_tx {
     foreach my $tx (QBitcoin::Transaction->mempool_list()) {
-        return 1 if $tx->is_coinbase || $tx->is_slashing;
+        return 1 if $tx->is_coinbase;
+        return 1 if $tx->is_slashing && !grep { $_->{txo}->tx_out } @{$tx->in};
     }
     return 0;
 }
@@ -326,13 +405,17 @@ sub generate {
                     # Our block already occupies this slot (its stake is published).
                     # Regenerating it would re-sign the same (slot, UTXO) => self-
                     # equivocation, so we never unconfirm it. But if a new weight-
-                    # increasing transaction (coinbase/burn/downgrade/slashing) has
+                    # increasing transaction (coinbase/slashing) has
                     # appeared, build a SIBLING competing block with a still-free stake
                     # address (make_stake_tx skips published UTXOs) - like a second
                     # independent validator - WITHOUT unconfirming the published block.
                     if (!_have_weight_tx()) {
                         Debugf("Keep our published block %s height %u for slot %u, nothing new to add",
                             $prev_block->hash_str, $height, $timeslot);
+                        # The decision stands until a new trigger (generate_new) or the next
+                        # slot; without closing the gate here every main-loop pass would
+                        # re-evaluate it and repeat the message for the rest of the slot
+                        QBitcoin::Generate::Control->generated_time($timeslot);
                         return;
                     }
                     Debugf("Slot %u already staked; build a sibling block with a free address", $timeslot);
@@ -419,9 +502,13 @@ sub _generate {
         # Create new coinbase transaction and add it to mempool (if it's not there)
         QBitcoin::Transaction->new_coinbase($coinbase, $upgrade_level);
     }
+    my $prev_height = $prev_block ? $prev_block->height : -1;
     # Just get upper limit for the stake tx size
-    my $stake_tx = make_stake_tx("0e0", "", $timeslot);
+    my $stake_tx = make_stake_tx("0e0", "", $timeslot, $prev_height);
     my $size = $stake_tx ? $stake_tx->size : 0;
+    # True while the signed stake is known to have never left this node; lets us void
+    # its (slot, UTXO) commitment if the generated block does not enter the best branch
+    my $stake_private = 0;
 
     my @transactions = QBitcoin::Mempool->choose_for_block($size, $timeslot, $prev_block, $stake_tx && $stake_tx->in, $contest);
     if (!@transactions && ($timeslot - GENESIS_TIME) / BLOCK_INTERVAL % FORCE_BLOCKS != 0) {
@@ -461,10 +548,8 @@ sub _generate {
         my $tx_hashes = "";
         $tx_hashes .= $_->hash foreach @transactions;
         my $prev_hash = $prev_block ? $prev_block->hash : ZERO_HASH;
-        my $block_sign_data = $timeslot < SLASHING_START
-            ? $prev_hash . $tx_hashes
-            : $prev_hash . pack("N", $timeslot) . hash256($tx_hashes);
-        $stake_tx = make_stake_tx($reward, $block_sign_data, $timeslot);
+        my $block_sign_data = $prev_hash . pack("N", $timeslot) . hash256($tx_hashes);
+        $stake_tx = make_stake_tx($reward, $block_sign_data, $timeslot, $prev_height);
         Infof("Generated stake tx %s with input amount %lu, consume %lu fee", $stake_tx->hash_str,
             sum0(map { $_->{txo}->value } @{$stake_tx->in}), -$stake_tx->fee);
         # Slashing self-guard (skip genesis / inputless stake): never (re)stake the
@@ -502,8 +587,20 @@ sub _generate {
             or die "Incorrect generated stake transaction\n";
         $stake_tx->save() == 0
             or die "Can't save stake transaction\n";
+        # The signed stake now lives in the global caches: from here it can end up in a
+        # block (ours or a peer's pending one via recv_pending_tx below) whether or not
+        # our block becomes best. Record it immediately so we never sign a conflicting
+        # stake for the same (slot, UTXO). Recording only when the block entered the
+        # best branch left a hole: after a lost-on-weight block the next generation in
+        # the same slot reused the UTXO with a different block_sign_data, and the
+        # equivocation detector (which observes our own blocks too) slashed ourselves.
+        QBitcoin::Generate::Control->record_stake($timeslot, $stake_tx);
+        $stake_private = 1;
         $stake_tx->process_pending();
         if (defined(my $height = QBitcoin::Block->recv_pending_tx($stake_tx))) {
+            # A pending peer block references this stake's hash: the stake is out (or at
+            # least its hash is), so its commitment must stand whatever happens below
+            $stake_private = 0;
             Infof("Generated stake tx %s is pending by a block, process it and skip new block generation", $stake_tx->hash_str);
             if ($height != -1) {
                 my $block = QBitcoin::Block->best_block($height);
@@ -536,12 +633,15 @@ sub _generate {
     # Remove the block from cache (and free my utxo) if it was not added as best block
     if (QBitcoin::Block->best_block->hash ne $generated->hash) {
         $generated->free();
-    }
-    elsif (@{$generated->transactions} && $generated->transactions->[0]->is_stake
-           && @{$generated->transactions->[0]->in}) {
-        # Our block entered the best branch, so its stake signature may reach peers:
-        # record it so we never sign a conflicting stake for the same (slot, UTXO).
-        QBitcoin::Generate::Control->record_stake($timeslot, $generated->transactions->[0]);
+        if ($stake_private) {
+            # The losing block was never announced (receive() rejects it before the
+            # announce path) and free() dropped its stake tx from all caches, so the
+            # stake signature never left this node and can never become equivocation
+            # evidence. Void its commitment and stop watching it: the same UTXOs may
+            # safely (and profitably) stake a different block later in this timeslot
+            QBitcoin::Generate::Control->unrecord_stake($timeslot, $stake_tx);
+            QBitcoin::Slashing->forget_stake($stake_tx, $timeslot);
+        }
     }
     return $generated;
 }

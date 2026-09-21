@@ -1,8 +1,10 @@
 import type { UTXO } from '@/entities/Address';
 
+import { toBaseUnits } from '@/shared/lib/baseUnits';
+
 export interface SpendableUtxo {
     outpoint: string;
-    valueSat: number;
+    valueSat: bigint;
 }
 
 export interface TokenUtxo extends SpendableUtxo {
@@ -15,13 +17,16 @@ export interface TokenUtxoGroup {
 }
 
 interface ProcessedUtxos {
-    value: number;
+    value: bigint;
     utxos: SpendableUtxo[];
     tokens: Record<string, TokenUtxoGroup>;
 }
 
-const hasTokenData = (utxo: UTXO): boolean =>
-    utxo.token_id != null || utxo.token_amount != null || utxo.token_permissions != null;
+export const sumUtxoValues = (utxos: readonly SpendableUtxo[]): bigint =>
+    utxos.reduce((sum, utxo) => sum + utxo.valueSat, 0n);
+
+const carriesTokens = (utxo: UTXO): boolean =>
+    utxo.token_amount != null || utxo.token_permissions != null;
 
 export const processUtxos = (utxos: UTXO[]): ProcessedUtxos => {
     return utxos.reduce<ProcessedUtxos>(
@@ -30,33 +35,34 @@ export const processUtxos = (utxos: UTXO[]): ProcessedUtxos => {
                 return acc;
             }
 
-            if (hasTokenData(utxo)) {
-                if (
-                    utxo.token_id &&
-                    utxo.token_amount != null &&
-                    Number.isInteger(utxo.token_amount) &&
-                    !utxo.token_permissions
-                ) {
+            const valueSat = toBaseUnits(utxo.value);
+            if (valueSat === null) {
+                return acc;
+            }
+
+            if (carriesTokens(utxo)) {
+                const tokenAmount = toBaseUnits(utxo.token_amount);
+
+                if (utxo.token_id && tokenAmount !== null && !utxo.token_permissions) {
                     let group = acc.tokens[utxo.token_id];
                     if (!group) {
                         group = { amount: 0n, utxos: [] };
                         acc.tokens[utxo.token_id] = group;
                     }
-                    const tokenAmount = BigInt(utxo.token_amount);
                     group.amount += tokenAmount;
                     group.utxos.push({
                         outpoint: `${utxo.txid}:${utxo.vout}`,
-                        valueSat: utxo.value,
+                        valueSat,
                         tokenAmount,
                     });
                 }
                 return acc;
             }
 
-            acc.value += utxo.value;
-            acc.utxos.push({ outpoint: `${utxo.txid}:${utxo.vout}`, valueSat: utxo.value });
+            acc.value += valueSat;
+            acc.utxos.push({ outpoint: `${utxo.txid}:${utxo.vout}`, valueSat });
             return acc;
         },
-        { value: 0, utxos: [], tokens: {} }
+        { value: 0n, utxos: [], tokens: {} }
     );
 };

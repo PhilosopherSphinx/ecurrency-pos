@@ -3,7 +3,7 @@ use warnings;
 use strict;
 
 use List::Util qw(max);
-use QBitcoin::IP qw(ip_str parse_addr_port host_to_ips);
+use QBitcoin::IP qw(ip_str parse_addr_port host_to_ips is_ip_literal);
 use QBitcoin::Const;
 use QBitcoin::Config;
 use QBitcoin::BlockchainParams;
@@ -27,6 +27,9 @@ use constant FIELDS => {
     create_time       => NUMERIC,
     update_time       => NUMERIC,
     software          => STRING,
+    hostname          => STRING,  # self-announced in the "version" message; cosmetic, never used in logic
+    hostname_verified => NUMERIC, # the hostname resolves to the peer's address (see QBitcoin::Resolver)
+    hostname_check_time => NUMERIC, # last hostname verification attempt (successful or not)
     features          => NUMERIC,
     ping_min_ms       => NUMERIC,
     ping_avg_ms       => NUMERIC,
@@ -40,6 +43,8 @@ use constant FIELDS => {
 
 mk_accessors(grep { $_ ne "reputation" } keys %{FIELDS()});
 mk_accessors(qw(in_db)); # true when the peer is stored in the database (not a transient incoming-connection peer)
+mk_accessors(qw(nonce));
+mk_accessors(qw(config_name)); # the name the peer is configured by ("peer"/"hidden-peer" options), when it is a DNS name
 
 my @PEERS; # by type_id and ip
 
@@ -79,6 +84,7 @@ sub get_or_create {
             return ();
         }
         $args->{port} = $port;
+        $args->{config_name} = $addr unless is_ip_literal($addr);
     }
     else {
         Errf("Neither peer ip nor host is specified");
@@ -128,6 +134,9 @@ sub get_or_create {
             $peer->{in_db} = 1;
             push @peers, $PEERS[$args->{type_id}]->{$ip} = $peer;
         }
+    }
+    if ($args->{config_name}) {
+        $_->config_name($args->{config_name}) foreach @peers;
     }
     return wantarray ? @peers : $peers[0];
 }
@@ -183,6 +192,17 @@ sub id {
     return $self->{id} //= ip_str($self->ip) // unpack("H*", $self->ip);
 }
 
+sub display_hostname {
+    my $self = shift;
+    return $self->hostname // $self->config_name;
+}
+
+sub display_hostname_verified {
+    my $self = shift;
+    return defined($self->hostname) ? ($self->hostname_verified ? 1 : 0)
+        : defined($self->config_name) ? 1 : 0;
+}
+
 sub ipv4 {
     my $self = shift;
     return substr($self->ip, 0, length(IPV6_V4_PREFIX)) eq IPV6_V4_PREFIX ?
@@ -229,9 +249,25 @@ sub conn_state {
     }
 }
 
+# True if we already have a connection with the node, established via another of its addresses
+sub node_connected {
+    my $self = shift;
+    my $nonce = $self->nonce
+        or return 0;
+    foreach my $connection (QBitcoin::ConnectionList->list()) {
+        next if $connection->type_id != $self->type_id;
+        next if $connection->addr eq $self->ip; # this address, it is handled by conn_state
+        my $protocol = $connection->protocol
+            or next;
+        return 1 if defined($protocol->remote_nonce) && $protocol->remote_nonce eq $nonce;
+    }
+    return 0;
+}
+
 sub is_connect_allowed {
     my $self = shift;
     return 0 if $self->conn_state != STATE_DISCONNECTED;
+    return 0 if $self->node_connected;
     return 0 if $self->status & PEER_STATUS_NOCALL;
     if ($self->failed_connects) {
         my $period = $self->failed_connects >= 10 ? 10 * 2**10 : 10 * 2**$self->failed_connects;

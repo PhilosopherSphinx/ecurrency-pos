@@ -33,10 +33,14 @@ $config->{allow_dumpprivkey} = 1;
     use QBitcoin::Accessors qw(mk_accessors);
     use Role::Tiny::With;
     with 'QBitcoin::RPC::Commands';
-    mk_accessors(qw(cmd args auth_password force _rpc_result _rpc_error _rpc_error_code));
+    mk_accessors(qw(cmd args auth_password force hide_response _rpc_result _rpc_error _rpc_error_code));
     sub new { bless {}, shift }
     sub response_ok    { $_[0]->_rpc_result($_[1] // "ok"); 0 }
     sub response_error { $_[0]->_rpc_error($_[1]); $_[0]->_rpc_error_code($_[2]); -1 }
+    # The brute-force limit needs a connection and is tested in password-throttle.t
+    sub auth_throttle_delay   { 0 }
+    sub register_auth_failure { }
+    sub register_auth_success { }
 }
 
 # Call a wallet RPC command; returns the TestRPC object for inspecting the result
@@ -70,10 +74,10 @@ ok(!TestRPC->requires_password('getwalletinfo'), "getwalletinfo is not gated");
 
 # Initial state
 my $info = rpc('getwalletinfo')->_rpc_result;
-is($info->{password_set},   JSON::XS::false, "no password initially");
-is($info->{keys_encrypted}, JSON::XS::false, "keys not encrypted initially");
-is($info->{locked},         JSON::XS::false, "not locked initially");
-is($info->{staking_active}, JSON::XS::true,  "staking active initially");
+is($info->{password_set},   Cpanel::JSON::XS::false, "no password initially");
+is($info->{keys_encrypted}, Cpanel::JSON::XS::false, "keys not encrypted initially");
+is($info->{locked},         Cpanel::JSON::XS::false, "not locked initially");
+is($info->{staking_active}, Cpanel::JSON::XS::true,  "staking active initially");
 is($info->{addresses},      1,               "one address");
 
 # walletunlock / walletlock are no-ops without encryption
@@ -84,10 +88,10 @@ like(rpc('walletlock')->_rpc_result,   qr/not encrypted/, "walletlock without en
 is(rpc('setwalletpassword', args => ["pass1"])->_rpc_result, "ok", "set the first password");
 ok(QBitcoin::Wallet->is_encrypted, "keys encrypted");
 $info = rpc('getwalletinfo')->_rpc_result;
-is($info->{password_set},   JSON::XS::true,  "password set");
-is($info->{keys_encrypted}, JSON::XS::true,  "keys encrypted in getwalletinfo");
-is($info->{locked},         JSON::XS::false, "unlocked right after setting the password");
-is($info->{staking_active}, JSON::XS::true,  "staking still active");
+is($info->{password_set},   Cpanel::JSON::XS::true,  "password set");
+is($info->{keys_encrypted}, Cpanel::JSON::XS::true,  "keys encrypted in getwalletinfo");
+is($info->{locked},         Cpanel::JSON::XS::false, "unlocked right after setting the password");
+is($info->{staking_active}, Cpanel::JSON::XS::true,  "staking still active");
 
 # dumpprivkey with the wallet unlocked (the generic password gate is emulated by
 # the caller: in the real flow QBitcoin::RPC::process_request has already
@@ -97,8 +101,8 @@ is(rpc('dumpprivkey', args => [$address1])->_rpc_result, $wif1, "dumpprivkey wit
 # Lock: staking stops, dumpprivkey needs the password
 is(rpc('walletlock')->_rpc_result, "ok", "walletlock");
 $info = rpc('getwalletinfo')->_rpc_result;
-is($info->{locked},         JSON::XS::true,  "locked");
-is($info->{staking_active}, JSON::XS::false, "staking inactive while locked");
+is($info->{locked},         Cpanel::JSON::XS::true,  "locked");
+is($info->{staking_active}, Cpanel::JSON::XS::false, "staking inactive while locked");
 is(rpc('dumpprivkey', args => [$address1], password => "pass1")->_rpc_result, $wif1,
     "dumpprivkey decrypts with the password while locked");
 ok(!QBitcoin::Wallet->unlocked, "dumpprivkey did not leave the wallet unlocked");
@@ -116,8 +120,8 @@ is(rpc('walletunlock', password => "wrong")->_rpc_error_code, ERR_WALLET_PASSWOR
 is(rpc('walletunlock', password => "pass1")->_rpc_result, "ok", "walletunlock");
 like(rpc('walletunlock', password => "pass1")->_rpc_result, qr/already unlocked/, "walletunlock is idempotent");
 $info = rpc('getwalletinfo')->_rpc_result;
-is($info->{locked},         JSON::XS::false, "unlocked");
-is($info->{staking_active}, JSON::XS::true,  "staking active after unlock");
+is($info->{locked},         Cpanel::JSON::XS::false, "unlocked");
+is($info->{staking_active}, Cpanel::JSON::XS::true,  "staking active after unlock");
 
 # importprivkey into the unlocked encrypted wallet stores the key encrypted
 like(rpc('importprivkey', args => [$wif2])->_rpc_result, qr/^Private key for address \Q$address2\E imported$/,
@@ -143,7 +147,7 @@ is(rpc('setwalletpassword', args => ["pass2"], password => "pass2")->_rpc_result
 ok(!QBitcoin::Wallet->is_encrypted, "keys decrypted");
 is(QBitcoin::MyAddress->find(address => $address1)->private_key, $wif1, "plaintext WIF back in the database");
 $info = rpc('getwalletinfo')->_rpc_result;
-is($info->{keys_encrypted}, JSON::XS::false, "not encrypted in getwalletinfo");
+is($info->{keys_encrypted}, Cpanel::JSON::XS::false, "not encrypted in getwalletinfo");
 ok(!$info->{warning}, "no warning when the state matches the policy");
 
 # importprivkey into an unencrypted wallet warns about plaintext storage

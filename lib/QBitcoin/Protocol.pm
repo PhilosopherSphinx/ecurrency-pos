@@ -5,12 +5,14 @@ use strict;
 # TCP exchange with a peer
 # Single connection
 # Commands:
-# >> version <version:4 features:8 time:8 my_address:26 nonce:8 software:1+n>
+# >> version <version:4 features:8 time:8 my_address:26 nonce:8 software:1+n hostname:1+n>
 #    my_address: features:8 addr:16 port:2 (port is the node's listening port, to dial it back
 #    and to announce it to other peers; 0 means the node does not accept incoming connections)
 #    nonce: random session id, used to detect duplicate connections with the same node
 #    software: 1-byte length + string, name and version of the node software (see SOFTWARE, as BIP14)
-#    nonce and software are optional (old nodes do not send them), unknown trailing data must be ignored
+#    hostname: 1-byte length + string, the node's self-announced host name ("hostname" config option);
+#    purely informational (getpeerinfo), never used in any logic; empty if not configured
+#    nonce, software and hostname are optional (old nodes do not send them), unknown trailing data must be ignored
 # << verack <options>
 # >> ihave <time> <weight> <hash>
 # << sendblock <hash>
@@ -51,10 +53,13 @@ use QBitcoin::BlockchainParams;
 use QBitcoin::Log;
 use QBitcoin::Accessors qw(mk_accessors);
 use QBitcoin::ProtocolState qw(mempool_synced blockchain_synced btc_synced sync_peer last_qbt_data_time);
+use QBitcoin::CheckPoints qw(max_checkpoint_height);
 use QBitcoin::Block;
 use QBitcoin::Transaction;
 use QBitcoin::TXO;
 use QBitcoin::Peer;
+use QBitcoin::Resolver;
+use QBitcoin::Generate;
 use QBitcoin::Generate::Control;
 use Bitcoin::Serialized;
 
@@ -87,9 +92,16 @@ sub my_nonce {
 
 sub startup {
     my $self = shift;
-    my $version = pack("VQ<Q<a26a8C/a*", PROTOCOL_VERSION, PROTOCOL_FEATURES, time(), $self->pack_my_address, my_nonce(), SOFTWARE);
+    my $version = pack("VQ<Q<a26a8C/a*C/a*", PROTOCOL_VERSION, PROTOCOL_FEATURES, time(), $self->pack_my_address,
+        my_nonce(), SOFTWARE, my_hostname());
     $self->send_message("version", $version);
     return 0;
+}
+
+sub my_hostname {
+    my $hostname = $config->{hostname} // return "";
+    $hostname =~ tr/\x20-\x7e//cd;
+    return substr($hostname, 0, HOSTNAME_MAX_LENGTH);
 }
 
 # The port on which this node accepts incoming connections, advertised to peers in the
@@ -141,19 +153,29 @@ sub cmd_version {
         $nonce = substr($data, 20 + 26, 8);
     }
     # Optional software name and version (see SOFTWARE), 1-byte length + string after the nonce
-    my $software;
+    my ($software, $hostname);
     if (length($data) >= 20 + 26 + 8 + 1) {
         my $len = unpack("C", substr($data, 54, 1));
         if (length($data) >= 55 + $len) {
             $software = substr($data, 55, $len);
             # the string is written to logs and to the database, keep only printable ascii
             $software =~ tr/\x20-\x7e//cd;
+            # Optional self-announced hostname (see my_hostname), 1-byte length + string after the software
+            my $offset = 55 + $len;
+            if (length($data) >= $offset + 1) {
+                my $hlen = unpack("C", substr($data, $offset, 1));
+                if (length($data) >= $offset + 1 + $hlen) {
+                    $hostname = substr($data, $offset + 1, $hlen);
+                    $hostname =~ tr/\x20-\x7e//cd;
+                    $hostname = substr($hostname, 0, HOSTNAME_MAX_LENGTH);
+                }
+            }
         }
     }
     if ($self->check_duplicate_connection($nonce) != 0) {
         return -1;
     }
-    if ($protocol_version < 3 && time() >= SLASHING_START) {
+    if ($protocol_version < 3) {
         Warningf("Peer %s protocol version %u is too old, closing", $self->peer->id, $protocol_version);
         $self->abort("old_protocol");
         return -1;
@@ -164,8 +186,11 @@ sub cmd_version {
     $self->greeted = 1;
     $self->protocol_version = $protocol_version;
     if ($self->connection->direction == DIR_OUT) {
-        # We reached this peer ourselves: it is confirmed reachable / accepts incoming connections.
-        $self->peer->connect_success();
+        # We reached this peer ourselves, but the handshake is complete only when the peer accepts
+        # our "version" with "verack" (see cmd_verack): it may still answer "reject".
+        # A reachability probe does not wait for "verack" (see QBitcoin::Network::check_probes):
+        # the peer's "version" alone proves it is alive and accepts incoming connections.
+        $self->peer->connect_success() if $self->connection->probe;
     }
     else {
         # Incoming connection: store the peer now that the greeting succeeded (req: do not persist random connects).
@@ -186,11 +211,13 @@ sub cmd_version {
             $peer->update(port => $adv_port_trusted) if $adv_port_trusted && $peer->port != $adv_port_trusted;
         }
     }
+    $self->peer->nonce($nonce) if defined $nonce;
     Infof("Peer %s greeted: version %u, features 0x%x, software %s",
         $self->peer->id, $protocol_version, $protocol_features, $software // "unknown");
     if (defined($software) && ($self->peer->software // "") ne $software) {
         $self->peer->update(software => $software);
     }
+    $self->update_peer_hostname($hostname) if defined($hostname);
     $self->request_btc_blocks() if UPGRADE_POW && !UPGRADE_FINISHED && !btc_synced();
     $self->request_mempool if blockchain_synced() && !mempool_synced() && !$self->wait_btc_sync;
     $self->announce_best_btc_block() if UPGRADE_POW && !UPGRADE_FINISHED;
@@ -203,8 +230,33 @@ sub cmd_version {
 
 sub cmd_verack {
     my $self = shift;
+    if ($self->connection->direction == DIR_OUT && !$self->connection->probe) {
+        # Outgoing handshake completed: the peer is confirmed reachable (a probe is counted on its "version")
+        $self->peer->connect_success();
+    }
     $self->request_peer_addresses;
     return 0;
+}
+
+sub update_peer_hostname {
+    my $self = shift;
+    my ($hostname) = @_;
+    my $peer = $self->peer;
+    if ($hostname eq "") {
+        # explicitly announced empty name (removed from the remote config): forget the stored one
+        $peer->update(hostname => undef, hostname_verified => 0) if defined($peer->hostname);
+        return;
+    }
+    if (($peer->hostname // "") ne $hostname) {
+        $peer->update(hostname => $hostname, hostname_verified => 0, hostname_check_time => undef);
+    }
+    my $stale = ($peer->hostname_check_time // 0) + HOSTNAME_CHECK_PERIOD <= time();
+    if (defined($peer->config_name) && $peer->config_name eq $hostname) {
+        $peer->update(hostname_verified => 1, hostname_check_time => time()) if !$peer->hostname_verified || $stale;
+    }
+    elsif ($stale) {
+        QBitcoin::Resolver->verify_hostname($peer);
+    }
 }
 
 # Request peer addresses if we don't have enough peers;
@@ -255,6 +307,7 @@ sub check_duplicate_connection {
             }
             if ($drop_this) {
                 Infof("Duplicate connection with peer %s, closing this one", $self->peer->id);
+                $self->peer->nonce($nonce);
                 # the handshake did succeed, closing a duplicate is not a failed connect
                 $self->greeted = 1;
                 $self->peer->connect_success() if $connection->direction == DIR_OUT;
@@ -658,16 +711,8 @@ sub process_tx {
                     $src_peer->add_reputation($tx->up ? 100 : 1) if $src_peer;
                 }
                 # Regenerate our block for the current timeslot to include this paid
-                # transaction and claim its reward by staking, but only if the slot has
-                # no block yet, or its block has no stake transaction (which can only be
-                # the first one), or the best block was generated by us
-                if (QBitcoin::TXO->staked_utxo) {
-                    my $best = QBitcoin::Block->best_block;
-                    if (!$best->received_from
-                        || !@{$best->transactions} || !$best->transactions->[0]->is_stake) {
-                        QBitcoin::Generate::Control->generate_new();
-                    }
-                }
+                # transaction and claim its reward by staking (see Generate::restake_for_tx)
+                QBitcoin::Generate->restake_for_tx($tx);
             }
         }
     }
@@ -739,7 +784,7 @@ sub request_new_block {
             }
             $self->syncing(1);
         }
-        elsif (!blockchain_synced() && $best_block) {
+        elsif (!blockchain_synced() && $best_block && $best_block->height >= max_checkpoint_height()) {
             if (timeslot($best_block->time) + FORCE_BLOCKS * BLOCK_INTERVAL >= timeslot(time())) {
                 Infof("Blockchain is synced");
                 blockchain_synced(1);
@@ -1044,6 +1089,10 @@ sub cmd_pong {
 sub cmd_reject {
     my $self = shift;
     Warningf("%s peer %s aborted connection", $self->type, $self->peer->id);
+    # The peer refused us (typically our "version"): count it as a failed connect so the exponential
+    # backoff (see QBitcoin::Peer::is_connect_allowed) stops us from reconnecting in a tight loop.
+    # Before the greeting Connection::failed() counts the failure itself, do not count it twice.
+    $self->peer->failed_connect() if $self->connection->direction == DIR_OUT && $self->greeted;
     return -1;
 }
 

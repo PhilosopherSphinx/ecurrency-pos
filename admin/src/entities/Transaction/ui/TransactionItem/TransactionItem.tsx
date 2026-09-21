@@ -4,6 +4,9 @@ import { Link } from 'react-router-dom';
 import type { TxShort } from '@/entities/Transaction';
 
 import { formatNumber, formatSat } from "@/shared/utils";
+import { useAssetLabel } from '@/shared/lib/network';
+
+import { TxTypeBadge } from '../TxTypeBadge/TxTypeBadge.tsx';
 
 import cls from './TransactionItem.module.css'
 
@@ -18,14 +21,18 @@ export const TransactionItem = memo(function TransactionItem(props: TransactionI
         transaction
     } = props;
 
-    const feerate = transaction.fee / transaction.size;
+    const assetLabel = useAssetLabel();
+    const feerate = Number(transaction.fee) / transaction.size;
 
     return (
         <div className={className}>
             <Link className={cls.txRow} to={`/tx/${transaction.txid}`}>
-                <div className={cls.txCell} data-label={`TXID`}>{transaction.txid}</div>
+                <div className={cls.txCell} data-label={`TXID`}>
+                    {transaction.txid}
+                    <TxTypeBadge type={transaction.tx_type} className={cls.badge} />
+                </div>
                 <div className={cls.txCell} data-label={`Value`}>
-                    {transaction.value !== null ? formatSat(transaction.value) : ''}
+                    {transaction.value !== null ? formatSat(transaction.value, assetLabel) : ''}
                 </div>
                 <div className={cls.txCell} data-label={`Size`}>
                     {`${formatNumber(transaction.size)} B`}

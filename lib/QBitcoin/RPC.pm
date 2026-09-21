@@ -2,7 +2,7 @@ package QBitcoin::RPC;
 use warnings;
 use strict;
 
-use JSON::PP;
+use Cpanel::JSON::XS;
 use Time::HiRes;
 use HTTP::Headers;
 use HTTP::Response;
@@ -11,15 +11,16 @@ use QBitcoin::RPC::Const;
 use QBitcoin::Log;
 use QBitcoin::Accessors qw(mk_accessors);
 use QBitcoin::Password;
+use QBitcoin::Password::Throttle qw(throttle_message);
 use parent qw(QBitcoin::HTTP);
 
 use Role::Tiny::With;
 with 'QBitcoin::RPC::Validate';
 with 'QBitcoin::RPC::Commands';
 
-mk_accessors(qw( cmd args auth_password force ));
+mk_accessors(qw( cmd args auth_password force hide_response ));
 
-my $JSON = JSON::PP->new->allow_bignum;
+my $JSON = Cpanel::JSON::XS->new->allow_bignum;
 
 sub type_id() { PROTOCOL_RPC }
 
@@ -77,12 +78,14 @@ sub process_request {
         Warningf("Incorrect rpc method [%s]", $body->{method});
         return $self->response_error("Unknown method", ERR_UNKNOWN_METHOD);
     }
+    # Workaround: boolean values does not encode without "allow_nonref" by Cpanel::JSON::XS version before 4.42
     Debugf("RPC request %s %s from %s:%u", $body->{method},
         $self->sensitive($body->{method}) ? "***"
-            : join(" ", map { ref($_) ? $JSON->encode($_) : $_ } @{$body->{params}}),
+            : join(" ", map { ref($_) ? $JSON->allow_nonref->encode($_) : $_ } @{$body->{params}}),
         $self->connection->ip, $self->connection->port);
     $self->args = $body->{params};
     $self->cmd  = $body->{method};
+    $self->hide_response = 0;
     # Optional top-level request fields (never logged), set by qbitcoin-cli on a
     # retry after ERR_WALLET_PASSWORD_REQUIRED / ERR_CONFIRMATION_REQUIRED
     $self->auth_password = ref($body->{password}) ? undef : $body->{password};
@@ -94,9 +97,16 @@ sub process_request {
         if (!defined $self->auth_password) {
             return $self->response_error("This command requires the wallet password", ERR_WALLET_PASSWORD_REQUIRED);
         }
+        # Brute-force limit: while the client is locked out, reject before the
+        # expensive password check, without disclosing whether the password matches
+        if (my $delay = $self->auth_throttle_delay) {
+            return $self->response_error(throttle_message($delay), ERR_WALLET_PASSWORD_INCORRECT);
+        }
         if (!QBitcoin::Password->check_password($self->auth_password)) {
+            $self->register_auth_failure;
             return $self->response_error("Incorrect wallet password", ERR_WALLET_PASSWORD_INCORRECT);
         }
+        $self->register_auth_success;
     }
     $self->validate_args == 0
         or return -1;
@@ -137,7 +147,7 @@ sub http_response {
     my $self = shift;
     my ($code, $message, $content) = @_;
     my $body = $JSON->encode($content);
-    Debugf("RPC response to %s:%u: %s", $self->connection->ip, $self->connection->port, $body);
+    Debugf("RPC response to %s:%u: %s", $self->connection->ip, $self->connection->port, $self->hide_response ? "***" : $body);
     my $headers = HTTP::Headers->new(
         Content_Type   => 'application/json',
         Content_Length => length($body),

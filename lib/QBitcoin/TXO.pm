@@ -40,7 +40,7 @@ my %TXO;
 
 sub key {
     my $self = shift;
-    return $self->tx_in . pack("v", $self->num);
+    return $self->tx_in . pack("s", $self->num);
 }
 
 sub save {
@@ -182,15 +182,18 @@ sub store_spend {
     # We're already inside SQL transaction created in QBitcoin::Block->store()
     my ($tx) = @_;
     my ($tx_in_id) = dbh->selectrow_array("SELECT id FROM `" . TRANSACTION_TABLE . "` WHERE hash = UNHEX(?)", undef, unpack("H*", $self->tx_in));
-    my $sql = "UPDATE `" . QBitcoin::RedeemScript->TABLE . "` SET script = UNHEX(?) WHERE hash = UNHEX(?) AND script IS NULL";
-    DEBUG_ORM && Debugf("dbi [%s] values [%s,%s]", $sql, unpack("H*", $self->redeem_script), unpack("H*", $self->scripthash));
-    my $res = dbh->do($sql, undef, unpack("H*", $self->redeem_script), unpack("H*", $self->scripthash));
-    $res
-        or die "Can't store txo " . $self->tx_in_str . ":" . $self->num . " as spend: " . (dbh->errstr // "no error") . "\n";
-    $sql = "UPDATE `" . TABLE . "` SET tx_out = ?, siglist = UNHEX(?) WHERE tx_in = ? AND num = ?";
+    if (defined $self->redeem_script) {
+        # Slashing inputs spend without revealing the redeem script, keep it NULL
+        my $sql = "UPDATE `" . QBitcoin::RedeemScript->TABLE . "` SET script = UNHEX(?) WHERE hash = UNHEX(?) AND script IS NULL";
+        DEBUG_ORM && Debugf("dbi [%s] values [%s,%s]", $sql, unpack("H*", $self->redeem_script), unpack("H*", $self->scripthash));
+        my $res = dbh->do($sql, undef, unpack("H*", $self->redeem_script), unpack("H*", $self->scripthash));
+        $res
+            or die "Can't store txo " . $self->tx_in_str . ":" . $self->num . " as spend: " . (dbh->errstr // "no error") . "\n";
+    }
+    my $sql = "UPDATE `" . TABLE . "` SET tx_out = ?, siglist = UNHEX(?) WHERE tx_in = ? AND num = ?";
     my $siglist = store_siglist($self->siglist);
     DEBUG_ORM && Debugf("dbi [%s] values [%u,'%s',%u,%u]", $sql, $tx->id, unpack("H*", $siglist), $tx_in_id, $self->num);
-    $res = dbh->do($sql, undef, $tx->id, unpack("H*", $siglist), $tx_in_id, $self->num);
+    my $res = dbh->do($sql, undef, $tx->id, unpack("H*", $siglist), $tx_in_id, $self->num);
     $res == 1
         or die "Can't store txo " . $self->tx_in_str . ":" . $self->num . " as spend: " . (dbh->errstr // "no error") . "\n";
 }
@@ -200,30 +203,7 @@ sub load_stored_inputs {
     my $class = shift;
     my ($tx_id, $tx_hash) = @_;
     # TODO: move this to QBitcoin::ORM
-    my $sql = "SELECT value, num, tx_in.hash AS tx_in, siglist, s.hash as scripthash, s.script as redeem_script, data";
-    $sql .= " FROM `" . $class->TABLE . "` AS t JOIN `" . QBitcoin::RedeemScript->TABLE . "` AS s ON (t.scripthash = s.id)";
-    $sql .= " JOIN `" . TRANSACTION_TABLE . "` AS tx_in ON (tx_in.id = t.tx_in)";
-    $sql .= " WHERE tx_out = ?";
-    my $sth = dbh->prepare($sql);
-    DEBUG_ORM && Debugf("sql: [%s] values [%u]", $sql, $tx_id);
-    $sth->execute($tx_id);
-    my @txo;
-    while (my $hash = $sth->fetchrow_hashref()) {
-        $hash->{tx_out} = $tx_hash;
-        my $txo = $class->new_saved($hash);
-        $txo->tx_out && $txo->tx_out eq $tx_hash
-            or die sprintf("Cached txo %s:%u has no tx_out %s\n", $txo->tx_in_str, $txo->num, unpack("H*", substr($tx_hash, 0, 4)));
-        push @txo, $txo;
-    }
-    DEBUG_ORM && Debugf("found %u entries", scalar(@txo));
-    return @txo;
-}
-
-sub load_stored_token_inputs {
-    my $class = shift;
-    my ($tx_id, $tx_hash) = @_;
-    # TODO: move this to QBitcoin::ORM
-    my $sql = "SELECT value, num, tx_in.hash AS tx_in, siglist, IFNULL(tx_token.hash, tx_in.hash) AS token_hash, s.hash as scripthash, s.script as redeem_script, data";
+    my $sql = "SELECT value, num, tx_in.hash AS tx_in, siglist, CASE WHEN tx_in.tx_type = " . TX_TYPE_TOKENS . " THEN IFNULL(tx_token.hash, tx_in.hash) ELSE NULL END as token_hash, s.hash as scripthash, s.script as redeem_script, data";
     $sql .= " FROM `" . $class->TABLE . "` AS t JOIN `" . QBitcoin::RedeemScript->TABLE . "` AS s ON (t.scripthash = s.id)";
     $sql .= " JOIN `" . TRANSACTION_TABLE . "` AS tx_in ON (tx_in.id = t.tx_in)";
     $sql .= " LEFT JOIN `" . TRANSACTION_TABLE . "` AS tx_token ON (tx_token.id = tx_in.token_id)";
@@ -329,6 +309,17 @@ sub unspent {
     return 0 if $self->{spent} && %{$self->{spent}};
     return 0 if $self->tx_out; # MB for transaction in a pending block
     return 1;
+}
+
+# Hash of the transaction spending this txo: the confirmed one if any, otherwise
+# an unconfirmed (mempool) one; undef if the txo is unspent.
+# Pending transactions (with unknown inputs) are not counted as spending.
+sub spent_by {
+    my $self = shift;
+    return $self->tx_out if $self->tx_out;
+    # Deterministic choice when the mempool holds conflicting spenders
+    my ($tx) = sort { $a->hash cmp $b->hash } grep { !defined $_->block_height } $self->spent_list;
+    return $tx ? $tx->hash : undef;
 }
 
 sub set_redeem_script {

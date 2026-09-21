@@ -12,7 +12,7 @@ WORKDIR /build
 
 RUN apk add --no-cache \
     perl openssl sqlite-libs gmp \
-    perl-json-xs perl-dbi perl-dbd-sqlite \
+    perl-cpanel-json-xs perl-dbi perl-dbd-sqlite \
     perl-http-message perl-hash-multivalue perl-params-validate \
     perl-role-tiny perl-tie-ixhash perl-cryptx
 
@@ -23,7 +23,7 @@ RUN apk add --no-cache \
 # pqclean does not build with alpine gcc due to musl; clang is ok
 RUN ln -s -f /usr/bin/clang /usr/bin/cc
 
-RUN cpan -i Encode::Base58::GMP Math::GMPz Crypt::PK::ECC::Schnorr Crypt::PQClean::Sign Crypt::Digest::Scrypt JSON::PP
+RUN cpan -i Encode::Base58::GMP Math::GMPz Crypt::PK::ECC::Schnorr Crypt::PQClean::Sign Crypt::Digest::Scrypt
 
 # Run tests
 RUN apk add --no-cache perl-test-mockmodule
@@ -40,7 +40,7 @@ WORKDIR /database
 
 RUN apk add --no-cache \
     perl openssl sqlite-libs gmp \
-    perl-json-xs perl-dbd-sqlite perl-dbd-mysql perl-dbi \
+    perl-cpanel-json-xs perl-dbd-sqlite perl-dbd-mysql perl-dbi \
     perl-http-message perl-hash-multivalue perl-params-validate \
     perl-role-tiny perl-tie-ixhash perl-cryptx busybox-extras
 
@@ -78,7 +78,6 @@ RUN { \
     notify_args="--notify-udp=127.0.0.1:9665"; \
   fi; \
   exec /qecurrency/bin/qecurrencyd \
-      --fallback-peer=seed.ecurrency.org \
       --dbi=${dbi} \
       --database=${database} \
       --rest="127.0.0.1:9668" \
